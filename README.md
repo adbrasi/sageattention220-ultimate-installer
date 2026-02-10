@@ -1,69 +1,62 @@
 # SageAttention 2.2.0 Ultimate Installer (RTX 5090)
 
-This repo contains one script: `install_sageattention220_wheel.sh`.
+Script: `install_sageattention220_wheel.sh`
 
-It is designed for repeated installs on similar machines (same Docker base, CUDA stack, RTX 5090) with this workflow:
-1. Always install/validate PyTorch + Triton first.
-2. Try prebuilt `sageattention` wheel (local or Hugging Face).
-3. If wheel is missing/fails, build locally for `sm_120`, install it, and upload wheel + manifest to Hugging Face.
+Fluxo implementado:
+1. Instala/reinstala PyTorch + Triton primeiro.
+2. Tenta instalar wheel por URL direta do Hugging Face (estilo `comfywheel`).
+3. Se falhar, tenta wheel indicada por `latest.json` no HF.
+4. Se ainda falhar, compila local (`sm_120`), instala e faz upload da wheel + manifest no HF.
 
-## Exact Version Policy
+## URL direta (prioridade 1)
 
-The exact runtime stack is locked by `latest.json` in Hugging Face:
-- `torch_version`
-- `torchvision_version`
-- `torchaudio_version`
-- `triton_version`
-- `torch_index_url`
-- wheel filename + checksum
+O script tenta primeiro o formato abaixo (dinâmico por versão do Python):
 
-On new machines, the script reads that manifest first and installs those exact versions before installing the wheel.
+`https://huggingface.co/adbrasi/comfywheel/resolve/main/sageattention-2.2.0-cpXY-cpXY-linux_x86_64.whl`
 
-## Required Base
+Exemplo que você citou:
 
-- NVIDIA GPU: RTX 5090 (compute capability 12.0 / `sm_120`)
-- CUDA Toolkit with `nvcc` available (CUDA 12.8+)
-- Python 3.11 or 3.12
-- Linux environment
+`https://huggingface.co/adbrasi/comfywheel/resolve/main/sageattention-2.2.0-cp312-cp312-linux_x86_64.whl`
 
-## First Machine (build + publish)
+## Repositório HF
+
+- Repo usado por padrão: `adbrasi/comfywheel`
+- Tipo padrão: `model`
+- Manifest em: `sageattention220/latest.json` dentro do repo
+
+## Versões padrão do instalador
+
+- `SAGE_VERSION=2.2.0`
+- `TORCH_CHANNEL=nightly`
+- `CUDA_INDEX_VARIANT=cu128`
+- `TRITON_SPEC=triton>=3.3`
+- `TORCH_CUDA_ARCH_LIST=12.0`
+- `CUDAARCHS=120`
+
+## Comando único
 
 ```bash
-export HF_REPO_ID="<your_hf_user_or_org>/<your_repo>"
-export HF_TOKEN="<your_hf_token>"
-
 curl -fsSL https://raw.githubusercontent.com/adbrasi/sageattention220-ultimate-installer/main/install_sageattention220_wheel.sh | bash -s -- auto
 ```
 
-This first run will:
-- install torch/triton,
-- try existing wheel from HF,
-- build wheel if needed,
-- upload wheel + `latest.json` to HF.
-
-## Next Machines (instant install from wheel)
+## Criar/validar repo HF (se necessário)
 
 ```bash
-export HF_REPO_ID="<your_hf_user_or_org>/<your_repo>"
-# export HF_TOKEN="<your_hf_token>"   # needed only for private HF repo
-
-curl -fsSL https://raw.githubusercontent.com/adbrasi/sageattention220-ultimate-installer/main/install_sageattention220_wheel.sh | bash -s -- auto
+export HF_TOKEN="<seu_token_hf>"
+curl -fsSL https://raw.githubusercontent.com/adbrasi/sageattention220-ultimate-installer/main/install_sageattention220_wheel.sh | bash -s -- init-hf
 ```
 
-If wheel + manifest already exist, install is wheel-first (no rebuild).
+## Override útil
 
-## Optional: Explicit Pin from Environment
-
-You can force exact versions manually (overrides manifest):
+Se quiser forçar URL exata da wheel:
 
 ```bash
-export TORCH_VERSION="<exact_torch_version>"
-export TORCHVISION_VERSION="<exact_torchvision_version>"
-export TORCHAUDIO_VERSION="<exact_torchaudio_version>"
-export TRITON_VERSION="<exact_triton_version>"
+export WHEEL_URL="https://huggingface.co/adbrasi/comfywheel/resolve/main/sageattention-2.2.0-cp312-cp312-linux_x86_64.whl"
 ```
 
-## Notes
+Se quiser trocar repo HF:
 
-- Default build target is `TORCH_CUDA_ARCH_LIST=12.0` and `CUDAARCHS=120`.
-- If you want PTX fallback, set `TORCH_CUDA_ARCH_LIST=12.0+PTX`.
+```bash
+export HF_DIRECT_REPO_ID="user/repo"
+export HF_REPO_ID="user/repo"
+```

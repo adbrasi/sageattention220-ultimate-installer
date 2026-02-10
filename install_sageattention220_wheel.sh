@@ -4,7 +4,7 @@ set -Eeuo pipefail
 # Ultimate SageAttention 2.2.0 installer for RTX 5090 (sm_120) + CUDA 12.8+
 # Workflow:
 # 1) Always install/validate PyTorch stack first
-# 2) Try prebuilt wheel (local/HF)
+# 2) Try prebuilt wheel from Hugging Face (or explicit URL)
 # 3) Fallback: build local wheel, install, upload to HF
 
 ACTION="${1:-auto}"
@@ -36,12 +36,19 @@ WHEELHOUSE_DIR="${WHEELHOUSE_DIR:-$PWD/wheelhouse}"
 LOG_DIR="${LOG_DIR:-$PWD/logs}"
 REMOTE_DIR="${REMOTE_DIR:-sageattention220}"
 
-# Optional direct wheel URL
+# Optional direct wheel URL (highest priority)
 WHEEL_URL="${WHEEL_URL:-}"
 
-# Hugging Face config (wheel storage)
-HF_REPO_ID="${HF_REPO_ID:-}"            # ex: user/sageattention-wheels
-HF_REPO_TYPE="${HF_REPO_TYPE:-dataset}" # dataset|model|space
+# HF direct-wheel style (the "comfywheel vibe")
+HF_DIRECT_REPO_ID="${HF_DIRECT_REPO_ID:-adbrasi/comfywheel}"
+HF_DIRECT_REPO_TYPE="${HF_DIRECT_REPO_TYPE:-model}" # dataset|model|space
+HF_DIRECT_BRANCH="${HF_DIRECT_BRANCH:-main}"
+HF_DIRECT_WHEEL_FILE="${HF_DIRECT_WHEEL_FILE:-}"
+
+# Hugging Face config for manifest + upload
+HF_REPO_ID="${HF_REPO_ID:-adbrasi/comfywheel}"
+HF_REPO_TYPE="${HF_REPO_TYPE:-model}" # dataset|model|space
+HF_REPO_BRANCH="${HF_REPO_BRANCH:-main}"
 HF_TOKEN="${HF_TOKEN:-}"
 HF_PRIVATE="${HF_PRIVATE:-false}"
 
@@ -63,20 +70,22 @@ die() {
 usage() {
   cat <<USAGE
 Uso:
-  ./install_sageattention220_wheel.sh [auto|install|build|publish]
+  ./install_sageattention220_wheel.sh [auto|install|build|publish|init-hf]
 
 Ação padrão: auto
-  auto    -> instala stack torch/triton, tenta wheel pronta (local/HF); se falhar, compila e publica no HF
-  install -> instala stack torch/triton e tenta somente wheel pronta (local/HF)
+  auto    -> instala stack torch/triton, tenta wheel pronta (HF/URL); se falhar, compila e publica no HF
+  install -> instala stack torch/triton e tenta somente wheel pronta (HF/URL)
   build   -> instala stack torch/triton, força build local e instala
-  publish -> publica a wheel local mais recente no Hugging Face
+  publish -> publica no HF a wheel local mais recente (gerada por build)
+  init-hf -> cria/valida o repositório no Hugging Face (sem build)
 
 Variáveis principais:
   PYTHON_BIN=python3
   TORCH_CHANNEL=nightly|stable
   CUDA_INDEX_VARIANT=cu128
   TORCH_CUDA_ARCH_LIST=12.0
-  HF_REPO_ID=usuario/repositorio
+  HF_DIRECT_REPO_ID=adbrasi/comfywheel
+  HF_REPO_ID=adbrasi/comfywheel
   HF_TOKEN=...
 
 Pin exato de versões (opcional):
@@ -134,20 +143,39 @@ default_torch_index_url() {
   fi
 }
 
+hf_prefix_for_type() {
+  local repo_type="$1"
+  case "$repo_type" in
+    dataset) printf 'datasets/' ;;
+    space) printf 'spaces/' ;;
+    *) printf '' ;;
+  esac
+}
+
+build_hf_resolve_url() {
+  local repo_id="$1"
+  local repo_type="$2"
+  local branch="$3"
+  local path="$4"
+  local prefix
+  prefix="$(hf_prefix_for_type "$repo_type")"
+  printf 'https://huggingface.co/%s%s/resolve/%s/%s' "$prefix" "$repo_id" "$branch" "$path"
+}
+
+python_cp_tag() {
+  "$PYTHON_BIN" - <<'PY'
+import sys
+print(f"cp{sys.version_info.major}{sys.version_info.minor}")
+PY
+}
+
 fetch_hf_manifest() {
   [[ -n "$HF_REPO_ID" ]] || return 1
 
-  local prefix=""
   local latest_url
   local latest_json="$WORK_DIR/hf-latest.json"
 
-  if [[ "$HF_REPO_TYPE" == "dataset" ]]; then
-    prefix="datasets/"
-  elif [[ "$HF_REPO_TYPE" == "space" ]]; then
-    prefix="spaces/"
-  fi
-
-  latest_url="https://huggingface.co/${prefix}${HF_REPO_ID}/resolve/main/${REMOTE_DIR}/latest.json"
+  latest_url="$(build_hf_resolve_url "$HF_REPO_ID" "$HF_REPO_TYPE" "$HF_REPO_BRANCH" "${REMOTE_DIR}/latest.json")"
   log "Tentando baixar manifest do HF: $latest_url"
 
   if [[ -n "$HF_TOKEN" ]]; then
@@ -172,6 +200,7 @@ parse_manifest_stack() {
   MANIFEST_TRITON_VERSION=""
   MANIFEST_TORCH_INDEX_URL=""
   MANIFEST_WHEEL_FILE=""
+  MANIFEST_HF_WHEEL_URL=""
 
   if [[ -z "$manifest_path" || ! -f "$manifest_path" ]]; then
     return 0
@@ -187,6 +216,7 @@ print(d.get("torchaudio_version") or "")
 print(d.get("triton_version") or "")
 print(d.get("torch_index_url") or "")
 print(d.get("wheel_file") or "")
+print(d.get("hf_wheel_url") or "")
 PY
 )
 
@@ -196,6 +226,7 @@ PY
   MANIFEST_TRITON_VERSION="${_vals[3]:-}"
   MANIFEST_TORCH_INDEX_URL="${_vals[4]:-}"
   MANIFEST_WHEEL_FILE="${_vals[5]:-}"
+  MANIFEST_HF_WHEEL_URL="${_vals[6]:-}"
 }
 
 install_torch_stack() {
@@ -317,62 +348,69 @@ PY
   return 0
 }
 
-try_install_from_local() {
-  local wheel_path
-  wheel_path="$(get_latest_local_wheel || true)"
-  [[ -n "$wheel_path" ]] || return 1
+install_wheel_url() {
+  local wheel_url="$1"
+  [[ -n "$wheel_url" ]] || return 1
 
-  log "Tentando wheel local: $wheel_path"
-  install_wheel_file "$wheel_path"
+  log "Tentando instalação por URL: $wheel_url"
+  "$PYTHON_BIN" -m pip install --force-reinstall "$wheel_url" || return 1
+
+  "$PYTHON_BIN" - <<'PY'
+import importlib.metadata as md
+print(f"[INFO] sageattention instalado: {md.version('sageattention')}")
+PY
+
+  return 0
 }
 
 try_install_from_hf() {
   [[ -n "$HF_REPO_ID" ]] || return 1
 
-  local prefix=""
   local wheel_file="${MANIFEST_WHEEL_FILE:-}"
   local wheel_url
-  local tmp_wheel="$WORK_DIR/hf-wheel-$(date +%s).whl"
+
+  if [[ -n "${MANIFEST_HF_WHEEL_URL:-}" ]]; then
+    install_wheel_url "$MANIFEST_HF_WHEEL_URL" && return 0
+  fi
 
   [[ -n "$wheel_file" ]] || return 1
 
-  if [[ "$HF_REPO_TYPE" == "dataset" ]]; then
-    prefix="datasets/"
-  elif [[ "$HF_REPO_TYPE" == "space" ]]; then
-    prefix="spaces/"
-  fi
-
-  wheel_url="https://huggingface.co/${prefix}${HF_REPO_ID}/resolve/main/${REMOTE_DIR}/${wheel_file}"
-  log "Tentando wheel do HF: $wheel_url"
-
-  if [[ -n "$HF_TOKEN" ]]; then
-    curl -fsSL -H "Authorization: Bearer $HF_TOKEN" "$wheel_url" -o "$tmp_wheel" || return 1
-  else
-    curl -fsSL "$wheel_url" -o "$tmp_wheel" || return 1
-  fi
-
-  install_wheel_file "$tmp_wheel"
+  wheel_url="$(build_hf_resolve_url "$HF_REPO_ID" "$HF_REPO_TYPE" "$HF_REPO_BRANCH" "${REMOTE_DIR}/${wheel_file}")"
+  install_wheel_url "$wheel_url"
 }
 
 try_install_from_url() {
-  local url="$WHEEL_URL"
-  [[ -n "$url" ]] || return 1
+  local cp_tag wheel_file default_url alt_wheel_file alt_url
 
-  local tmp_wheel="$WORK_DIR/url-wheel-$(date +%s).whl"
-  log "Tentando wheel por URL direta"
-
-  if [[ -n "$HF_TOKEN" && "$url" == *"huggingface.co"* ]]; then
-    curl -fsSL -H "Authorization: Bearer $HF_TOKEN" "$url" -o "$tmp_wheel" || return 1
-  else
-    curl -fsSL "$url" -o "$tmp_wheel" || return 1
+  if [[ -n "$WHEEL_URL" ]]; then
+    install_wheel_url "$WHEEL_URL" && return 0
+    return 1
   fi
 
-  install_wheel_file "$tmp_wheel"
+  cp_tag="$(python_cp_tag)"
+
+  if [[ -n "$HF_DIRECT_WHEEL_FILE" ]]; then
+    wheel_file="$HF_DIRECT_WHEEL_FILE"
+  else
+    wheel_file="sageattention-${SAGE_VERSION}-${cp_tag}-${cp_tag}-linux_x86_64.whl"
+  fi
+
+  default_url="$(build_hf_resolve_url "$HF_DIRECT_REPO_ID" "$HF_DIRECT_REPO_TYPE" "$HF_DIRECT_BRANCH" "$wheel_file")"
+  if install_wheel_url "$default_url"; then
+    return 0
+  fi
+
+  if [[ -z "$HF_DIRECT_WHEEL_FILE" ]]; then
+    alt_wheel_file="sageattention-${SAGE_VERSION}-${cp_tag}-${cp_tag}-manylinux_2_17_x86_64.manylinux2014_x86_64.whl"
+    alt_url="$(build_hf_resolve_url "$HF_DIRECT_REPO_ID" "$HF_DIRECT_REPO_TYPE" "$HF_DIRECT_BRANCH" "$alt_wheel_file")"
+    install_wheel_url "$alt_url" && return 0
+  fi
+
+  return 1
 }
 
 install_from_any_prebuilt() {
   try_install_from_url && return 0
-  try_install_from_local && return 0
   try_install_from_hf && return 0
   return 1
 }
@@ -391,19 +429,13 @@ build_manifest() {
   local wheel_file
   local sha
   local hf_url=""
-  local prefix=""
   local out
 
   wheel_file="$(basename "$wheel_path")"
   sha="$(wheel_sha256 "$wheel_path")"
 
   if [[ -n "$HF_REPO_ID" ]]; then
-    if [[ "$HF_REPO_TYPE" == "dataset" ]]; then
-      prefix="datasets/"
-    elif [[ "$HF_REPO_TYPE" == "space" ]]; then
-      prefix="spaces/"
-    fi
-    hf_url="https://huggingface.co/${prefix}${HF_REPO_ID}/resolve/main/${REMOTE_DIR}/${wheel_file}"
+    hf_url="$(build_hf_resolve_url "$HF_REPO_ID" "$HF_REPO_TYPE" "$HF_REPO_BRANCH" "${REMOTE_DIR}/${wheel_file}")"
   fi
 
   out="$(manifest_latest_path)"
@@ -461,14 +493,15 @@ publish_to_hf() {
   local wheel_path="$1"
   local latest_json
 
-  [[ -n "$HF_REPO_ID" ]] || { warn "HF_REPO_ID não definido; pulando upload para HF."; return 0; }
-  [[ -n "$HF_TOKEN" ]] || { warn "HF_TOKEN não definido; pulando upload para HF."; return 0; }
+  [[ -n "$HF_REPO_ID" ]] || die "HF_REPO_ID não definido."
+  [[ -n "$HF_TOKEN" ]] || die "HF_TOKEN não definido."
+
+  ensure_hf_repo
 
   latest_json="$(manifest_latest_path)"
   [[ -f "$latest_json" ]] || die "Manifest não encontrado: $latest_json"
 
   log "Publicando wheel + manifest no Hugging Face"
-  "$PYTHON_BIN" -m pip install -U huggingface_hub
 
   WHEEL_PATH="$wheel_path" \
   LATEST_JSON_PATH="$latest_json" \
@@ -487,10 +520,7 @@ repo_id = os.environ["HF_REPO_ID"]
 repo_type = os.environ.get("HF_REPO_TYPE", "dataset")
 token = os.environ["HF_TOKEN"]
 remote_dir = os.environ.get("REMOTE_DIR", "sageattention220")
-private = os.environ.get("HF_PRIVATE", "false").lower() == "true"
-
 api = HfApi(token=token)
-api.create_repo(repo_id=repo_id, repo_type=repo_type, private=private, exist_ok=True)
 
 for local in (wheel, latest):
     remote = f"{remote_dir}/{os.path.basename(local)}"
@@ -503,6 +533,31 @@ for local in (wheel, latest):
     )
 
 print("[INFO] Upload para HF concluído")
+PY
+}
+
+ensure_hf_repo() {
+  [[ -n "$HF_REPO_ID" ]] || die "HF_REPO_ID não definido."
+  [[ -n "$HF_TOKEN" ]] || die "HF_TOKEN não definido."
+
+  "$PYTHON_BIN" -m pip install -U huggingface_hub
+
+  HF_REPO_ID="$HF_REPO_ID" \
+  HF_REPO_TYPE="$HF_REPO_TYPE" \
+  HF_TOKEN="$HF_TOKEN" \
+  HF_PRIVATE="$HF_PRIVATE" \
+  "$PYTHON_BIN" - <<'PY'
+from huggingface_hub import HfApi
+import os
+
+api = HfApi(token=os.environ["HF_TOKEN"])
+api.create_repo(
+    repo_id=os.environ["HF_REPO_ID"],
+    repo_type=os.environ.get("HF_REPO_TYPE", "dataset"),
+    private=os.environ.get("HF_PRIVATE", "false").lower() == "true",
+    exist_ok=True,
+)
+print("[INFO] Repo Hugging Face criado/validado com sucesso")
 PY
 }
 
@@ -564,7 +619,7 @@ main() {
       usage
       exit 0
       ;;
-    auto|install|build|publish)
+    auto|install|build|publish|init-hf)
       ;;
     *)
       usage
@@ -583,7 +638,7 @@ main() {
   case "$ACTION" in
     install)
       install_torch_stack
-      install_from_any_prebuilt || die "Nenhuma wheel pronta encontrada (local/HF)."
+      install_from_any_prebuilt || die "Nenhuma wheel pronta encontrada (HF/URL)."
       validate_runtime
       ;;
 
@@ -603,15 +658,23 @@ main() {
       publish_to_hf "$wheel_path"
       ;;
 
+    init-hf)
+      ensure_hf_repo
+      ;;
+
     auto)
       install_torch_stack
       if install_from_any_prebuilt; then
         log "Wheel pronta instalada com sucesso (sem rebuild)."
       else
-        log "Wheel pronta não encontrada/falhou. Iniciando build local."
+        log "Wheel no HF não encontrada/falhou. Iniciando build local."
         local wheel_path
         wheel_path="$(build_wheel)"
-        publish_to_hf "$wheel_path"
+        if [[ -n "$HF_REPO_ID" && -n "$HF_TOKEN" ]]; then
+          publish_to_hf "$wheel_path"
+        else
+          warn "HF_REPO_ID/HF_TOKEN ausentes: wheel foi compilada e instalada, mas não publicada no HF."
+        fi
       fi
       validate_runtime
       ;;

@@ -1,0 +1,623 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Ultimate SageAttention 2.2.0 installer for RTX 5090 (sm_120) + CUDA 12.8+
+# Workflow:
+# 1) Always install/validate PyTorch stack first
+# 2) Try prebuilt wheel (local/HF)
+# 3) Fallback: build local wheel, install, upload to HF
+
+ACTION="${1:-auto}"
+
+SAGE_VERSION="${SAGE_VERSION:-2.2.0}"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
+
+# Torch stack strategy
+# - default: use TORCH_CHANNEL + CUDA_INDEX_VARIANT
+# - exact pin: set TORCH_VERSION/TORCHVISION_VERSION/TORCHAUDIO_VERSION/TRITON_VERSION
+TORCH_CHANNEL="${TORCH_CHANNEL:-nightly}"          # nightly|stable
+CUDA_INDEX_VARIANT="${CUDA_INDEX_VARIANT:-cu128}"  # cu128
+TORCH_VERSION="${TORCH_VERSION:-}"
+TORCHVISION_VERSION="${TORCHVISION_VERSION:-}"
+TORCHAUDIO_VERSION="${TORCHAUDIO_VERSION:-}"
+TRITON_VERSION="${TRITON_VERSION:-}"
+TRITON_SPEC="${TRITON_SPEC:-triton>=3.3}"
+TORCH_INDEX_URL="${TORCH_INDEX_URL:-}"
+
+# Build target for RTX 5090 (sm_120)
+TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-12.0}"
+CUDAARCHS="${CUDAARCHS:-120}"
+EXT_PARALLEL="${EXT_PARALLEL:-4}"
+MAX_JOBS="${MAX_JOBS:-$(nproc)}"
+NVCC_APPEND_FLAGS="${NVCC_APPEND_FLAGS:---threads 8}"
+
+WORK_DIR="${WORK_DIR:-$PWD/.build-sageattention}"
+WHEELHOUSE_DIR="${WHEELHOUSE_DIR:-$PWD/wheelhouse}"
+LOG_DIR="${LOG_DIR:-$PWD/logs}"
+REMOTE_DIR="${REMOTE_DIR:-sageattention220}"
+
+# Optional direct wheel URL
+WHEEL_URL="${WHEEL_URL:-}"
+
+# Hugging Face config (wheel storage)
+HF_REPO_ID="${HF_REPO_ID:-}"            # ex: user/sageattention-wheels
+HF_REPO_TYPE="${HF_REPO_TYPE:-dataset}" # dataset|model|space
+HF_TOKEN="${HF_TOKEN:-}"
+HF_PRIVATE="${HF_PRIVATE:-false}"
+
+mkdir -p "$WORK_DIR" "$WHEELHOUSE_DIR" "$LOG_DIR"
+
+log() {
+  printf '[INFO] %s\n' "$*"
+}
+
+warn() {
+  printf '[WARN] %s\n' "$*" >&2
+}
+
+die() {
+  printf '[ERROR] %s\n' "$*" >&2
+  exit 1
+}
+
+usage() {
+  cat <<USAGE
+Uso:
+  ./install_sageattention220_wheel.sh [auto|install|build|publish]
+
+Ação padrão: auto
+  auto    -> instala stack torch/triton, tenta wheel pronta (local/HF); se falhar, compila e publica no HF
+  install -> instala stack torch/triton e tenta somente wheel pronta (local/HF)
+  build   -> instala stack torch/triton, força build local e instala
+  publish -> publica a wheel local mais recente no Hugging Face
+
+Variáveis principais:
+  PYTHON_BIN=python3
+  TORCH_CHANNEL=nightly|stable
+  CUDA_INDEX_VARIANT=cu128
+  TORCH_CUDA_ARCH_LIST=12.0
+  HF_REPO_ID=usuario/repositorio
+  HF_TOKEN=...
+
+Pin exato de versões (opcional):
+  TORCH_VERSION=...
+  TORCHVISION_VERSION=...
+  TORCHAUDIO_VERSION=...
+  TRITON_VERSION=...
+USAGE
+}
+
+require_cmd() {
+  local cmd="$1"
+  command -v "$cmd" >/dev/null 2>&1 || die "Comando obrigatório não encontrado: $cmd"
+}
+
+ensure_python() {
+  require_cmd "$PYTHON_BIN"
+  "$PYTHON_BIN" - <<'PY'
+import sys
+print(f"[INFO] Python: {sys.version.split()[0]} ({sys.executable})")
+PY
+}
+
+ensure_pip_ready() {
+  "$PYTHON_BIN" -m pip install -U pip setuptools wheel
+}
+
+detect_gpu() {
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    local gpu_name gpu_cc
+    gpu_name="$(nvidia-smi --query-gpu=name --format=csv,noheader,nounits | head -n1 | xargs || true)"
+    gpu_cc="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader,nounits | head -n1 | xargs || true)"
+
+    log "GPU detectada: ${gpu_name:-desconhecida}"
+    log "Compute capability: ${gpu_cc:-desconhecida}"
+
+    if [[ "${gpu_name}" != *"RTX 5090"* ]]; then
+      warn "GPU não parece ser RTX 5090. Continuando mesmo assim."
+    fi
+    if [[ -n "$gpu_cc" && "$gpu_cc" != 12.0* ]]; then
+      warn "Compute capability não é 12.0 (esperado para RTX 5090)."
+    fi
+  else
+    warn "nvidia-smi não encontrado; validação de GPU foi pulada."
+  fi
+}
+
+default_torch_index_url() {
+  if [[ "$TORCH_CHANNEL" == "nightly" ]]; then
+    printf 'https://download.pytorch.org/whl/nightly/%s' "$CUDA_INDEX_VARIANT"
+  elif [[ "$TORCH_CHANNEL" == "stable" ]]; then
+    printf 'https://download.pytorch.org/whl/%s' "$CUDA_INDEX_VARIANT"
+  else
+    die "TORCH_CHANNEL inválido: $TORCH_CHANNEL (use nightly ou stable)"
+  fi
+}
+
+fetch_hf_manifest() {
+  [[ -n "$HF_REPO_ID" ]] || return 1
+
+  local prefix=""
+  local latest_url
+  local latest_json="$WORK_DIR/hf-latest.json"
+
+  if [[ "$HF_REPO_TYPE" == "dataset" ]]; then
+    prefix="datasets/"
+  elif [[ "$HF_REPO_TYPE" == "space" ]]; then
+    prefix="spaces/"
+  fi
+
+  latest_url="https://huggingface.co/${prefix}${HF_REPO_ID}/resolve/main/${REMOTE_DIR}/latest.json"
+  log "Tentando baixar manifest do HF: $latest_url"
+
+  if [[ -n "$HF_TOKEN" ]]; then
+    curl -fsSL -H "Authorization: Bearer $HF_TOKEN" "$latest_url" -o "$latest_json" || return 1
+  else
+    curl -fsSL "$latest_url" -o "$latest_json" || return 1
+  fi
+
+  if [[ ! -s "$latest_json" ]]; then
+    return 1
+  fi
+
+  echo "$latest_json"
+}
+
+parse_manifest_stack() {
+  local manifest_path="$1"
+
+  MANIFEST_TORCH_VERSION=""
+  MANIFEST_TORCHVISION_VERSION=""
+  MANIFEST_TORCHAUDIO_VERSION=""
+  MANIFEST_TRITON_VERSION=""
+  MANIFEST_TORCH_INDEX_URL=""
+  MANIFEST_WHEEL_FILE=""
+
+  if [[ -z "$manifest_path" || ! -f "$manifest_path" ]]; then
+    return 0
+  fi
+
+  readarray -t _vals < <("$PYTHON_BIN" - <<PY
+import json
+with open("$manifest_path", "r", encoding="utf-8") as f:
+    d = json.load(f)
+print(d.get("torch_version") or "")
+print(d.get("torchvision_version") or "")
+print(d.get("torchaudio_version") or "")
+print(d.get("triton_version") or "")
+print(d.get("torch_index_url") or "")
+print(d.get("wheel_file") or "")
+PY
+)
+
+  MANIFEST_TORCH_VERSION="${_vals[0]:-}"
+  MANIFEST_TORCHVISION_VERSION="${_vals[1]:-}"
+  MANIFEST_TORCHAUDIO_VERSION="${_vals[2]:-}"
+  MANIFEST_TRITON_VERSION="${_vals[3]:-}"
+  MANIFEST_TORCH_INDEX_URL="${_vals[4]:-}"
+  MANIFEST_WHEEL_FILE="${_vals[5]:-}"
+}
+
+install_torch_stack() {
+  local source_mode="default"
+  local idx_url="${TORCH_INDEX_URL:-}"
+  local torch_pkg=""
+  local tv_pkg=""
+  local ta_pkg=""
+  local triton_pkg=""
+
+  if [[ -n "$TORCH_VERSION" && -n "$TORCHVISION_VERSION" && -n "$TORCHAUDIO_VERSION" && -n "$TRITON_VERSION" ]]; then
+    source_mode="env-pin"
+    torch_pkg="torch==${TORCH_VERSION}"
+    tv_pkg="torchvision==${TORCHVISION_VERSION}"
+    ta_pkg="torchaudio==${TORCHAUDIO_VERSION}"
+    triton_pkg="triton==${TRITON_VERSION}"
+    if [[ -z "$idx_url" ]]; then
+      idx_url="$(default_torch_index_url)"
+    fi
+  elif [[ -n "${MANIFEST_TORCH_VERSION:-}" && -n "${MANIFEST_TORCHVISION_VERSION:-}" && -n "${MANIFEST_TORCHAUDIO_VERSION:-}" && -n "${MANIFEST_TRITON_VERSION:-}" ]]; then
+    source_mode="manifest-pin"
+    torch_pkg="torch==${MANIFEST_TORCH_VERSION}"
+    tv_pkg="torchvision==${MANIFEST_TORCHVISION_VERSION}"
+    ta_pkg="torchaudio==${MANIFEST_TORCHAUDIO_VERSION}"
+    triton_pkg="triton==${MANIFEST_TRITON_VERSION}"
+    if [[ -z "$idx_url" ]]; then
+      idx_url="${MANIFEST_TORCH_INDEX_URL:-$(default_torch_index_url)}"
+    fi
+  else
+    source_mode="default"
+    torch_pkg="torch"
+    tv_pkg="torchvision"
+    ta_pkg="torchaudio"
+    triton_pkg="$TRITON_SPEC"
+    if [[ -z "$idx_url" ]]; then
+      idx_url="$(default_torch_index_url)"
+    fi
+  fi
+
+  TORCH_INDEX_URL_USED="$idx_url"
+  export TORCH_INDEX_URL_USED
+
+  log "Instalando stack torch/triton (modo=${source_mode})"
+  log "Torch index: $idx_url"
+
+  if [[ "$source_mode" == "default" && "$TORCH_CHANNEL" == "nightly" ]]; then
+    "$PYTHON_BIN" -m pip install --force-reinstall --pre "$torch_pkg" "$tv_pkg" "$ta_pkg" --index-url "$idx_url"
+  else
+    "$PYTHON_BIN" -m pip install --force-reinstall "$torch_pkg" "$tv_pkg" "$ta_pkg" --index-url "$idx_url"
+  fi
+
+  "$PYTHON_BIN" -m pip install --force-reinstall -U "$triton_pkg"
+
+  "$PYTHON_BIN" - <<'PY'
+import importlib.metadata as md
+import torch
+
+print(f"[INFO] torch: {torch.__version__}")
+print(f"[INFO] torchvision: {md.version('torchvision')}")
+print(f"[INFO] torchaudio: {md.version('torchaudio')}")
+print(f"[INFO] triton: {md.version('triton')}")
+print(f"[INFO] torch.version.cuda: {torch.version.cuda}")
+print(f"[INFO] torch.cuda.is_available: {torch.cuda.is_available()}")
+if torch.cuda.is_available():
+    print(f"[INFO] device: {torch.cuda.get_device_name(0)}")
+    print(f"[INFO] capability: {torch.cuda.get_device_capability(0)}")
+print(f"[INFO] arch_list: {torch.cuda.get_arch_list()}")
+PY
+}
+
+ensure_cuda_home() {
+  if [[ -n "${CUDA_HOME:-}" && -x "${CUDA_HOME}/bin/nvcc" ]]; then
+    log "Usando CUDA_HOME existente: $CUDA_HOME"
+  elif command -v nvcc >/dev/null 2>&1; then
+    CUDA_HOME="$(dirname "$(dirname "$(command -v nvcc)")")"
+    export CUDA_HOME
+    log "CUDA_HOME detectado: $CUDA_HOME"
+  elif [[ -d "/usr/local/cuda-12.8" ]]; then
+    CUDA_HOME="/usr/local/cuda-12.8"
+    export CUDA_HOME
+    export PATH="$CUDA_HOME/bin:$PATH"
+    export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
+    log "CUDA_HOME definido para /usr/local/cuda-12.8"
+  else
+    die "CUDA toolkit/nvcc não encontrado (necessário para build)."
+  fi
+
+  "$PYTHON_BIN" - <<'PY'
+import subprocess
+print("[INFO] nvcc --version:")
+print(subprocess.check_output(["nvcc", "--version"], text=True))
+PY
+}
+
+get_latest_local_wheel() {
+  shopt -s nullglob
+  local wheels=("$WHEELHOUSE_DIR"/sageattention-"$SAGE_VERSION"-*.whl)
+  shopt -u nullglob
+
+  if (( ${#wheels[@]} == 0 )); then
+    return 1
+  fi
+
+  ls -1t "${wheels[@]}" | head -n1
+}
+
+install_wheel_file() {
+  local wheel_path="$1"
+  [[ -f "$wheel_path" ]] || return 1
+
+  log "Instalando wheel: $wheel_path"
+  "$PYTHON_BIN" -m pip install --force-reinstall "$wheel_path" || return 1
+
+  "$PYTHON_BIN" - <<'PY'
+import importlib.metadata as md
+print(f"[INFO] sageattention instalado: {md.version('sageattention')}")
+PY
+
+  return 0
+}
+
+try_install_from_local() {
+  local wheel_path
+  wheel_path="$(get_latest_local_wheel || true)"
+  [[ -n "$wheel_path" ]] || return 1
+
+  log "Tentando wheel local: $wheel_path"
+  install_wheel_file "$wheel_path"
+}
+
+try_install_from_hf() {
+  [[ -n "$HF_REPO_ID" ]] || return 1
+
+  local prefix=""
+  local wheel_file="${MANIFEST_WHEEL_FILE:-}"
+  local wheel_url
+  local tmp_wheel="$WORK_DIR/hf-wheel-$(date +%s).whl"
+
+  [[ -n "$wheel_file" ]] || return 1
+
+  if [[ "$HF_REPO_TYPE" == "dataset" ]]; then
+    prefix="datasets/"
+  elif [[ "$HF_REPO_TYPE" == "space" ]]; then
+    prefix="spaces/"
+  fi
+
+  wheel_url="https://huggingface.co/${prefix}${HF_REPO_ID}/resolve/main/${REMOTE_DIR}/${wheel_file}"
+  log "Tentando wheel do HF: $wheel_url"
+
+  if [[ -n "$HF_TOKEN" ]]; then
+    curl -fsSL -H "Authorization: Bearer $HF_TOKEN" "$wheel_url" -o "$tmp_wheel" || return 1
+  else
+    curl -fsSL "$wheel_url" -o "$tmp_wheel" || return 1
+  fi
+
+  install_wheel_file "$tmp_wheel"
+}
+
+try_install_from_url() {
+  local url="$WHEEL_URL"
+  [[ -n "$url" ]] || return 1
+
+  local tmp_wheel="$WORK_DIR/url-wheel-$(date +%s).whl"
+  log "Tentando wheel por URL direta"
+
+  if [[ -n "$HF_TOKEN" && "$url" == *"huggingface.co"* ]]; then
+    curl -fsSL -H "Authorization: Bearer $HF_TOKEN" "$url" -o "$tmp_wheel" || return 1
+  else
+    curl -fsSL "$url" -o "$tmp_wheel" || return 1
+  fi
+
+  install_wheel_file "$tmp_wheel"
+}
+
+install_from_any_prebuilt() {
+  try_install_from_url && return 0
+  try_install_from_local && return 0
+  try_install_from_hf && return 0
+  return 1
+}
+
+wheel_sha256() {
+  local path="$1"
+  sha256sum "$path" | awk '{print $1}'
+}
+
+manifest_latest_path() {
+  printf '%s/%s/latest.json' "$WHEELHOUSE_DIR" "$REMOTE_DIR"
+}
+
+build_manifest() {
+  local wheel_path="$1"
+  local wheel_file
+  local sha
+  local hf_url=""
+  local prefix=""
+  local out
+
+  wheel_file="$(basename "$wheel_path")"
+  sha="$(wheel_sha256 "$wheel_path")"
+
+  if [[ -n "$HF_REPO_ID" ]]; then
+    if [[ "$HF_REPO_TYPE" == "dataset" ]]; then
+      prefix="datasets/"
+    elif [[ "$HF_REPO_TYPE" == "space" ]]; then
+      prefix="spaces/"
+    fi
+    hf_url="https://huggingface.co/${prefix}${HF_REPO_ID}/resolve/main/${REMOTE_DIR}/${wheel_file}"
+  fi
+
+  out="$(manifest_latest_path)"
+  mkdir -p "$(dirname "$out")"
+
+  WHEEL_FILE="$wheel_file" \
+  WHEEL_SHA256="$sha" \
+  HF_WHEEL_URL="$hf_url" \
+  TORCH_INDEX_URL_USED="${TORCH_INDEX_URL_USED:-}" \
+  TORCH_CUDA_ARCH_LIST="$TORCH_CUDA_ARCH_LIST" \
+  OUT_MANIFEST="$out" \
+  "$PYTHON_BIN" - <<'PY'
+import datetime
+import importlib.metadata as md
+import json
+import os
+import platform
+import sys
+
+
+def pkg_ver(name):
+    try:
+        return md.version(name)
+    except Exception:
+        return None
+
+manifest = {
+    "created_at_utc": datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+    "wheel_file": os.environ["WHEEL_FILE"],
+    "wheel_sha256": os.environ["WHEEL_SHA256"],
+    "sageattention_version": pkg_ver("sageattention") or "2.2.0",
+    "torch_version": pkg_ver("torch"),
+    "torchvision_version": pkg_ver("torchvision"),
+    "torchaudio_version": pkg_ver("torchaudio"),
+    "triton_version": pkg_ver("triton"),
+    "torch_index_url": os.environ.get("TORCH_INDEX_URL_USED") or None,
+    "target_arch": os.environ["TORCH_CUDA_ARCH_LIST"],
+    "python_version": platform.python_version(),
+    "python_tag": f"cp{sys.version_info.major}{sys.version_info.minor}",
+    "platform": platform.platform(),
+    "machine": platform.machine(),
+    "hf_wheel_url": os.environ.get("HF_WHEEL_URL") or None,
+}
+
+out = os.environ["OUT_MANIFEST"]
+os.makedirs(os.path.dirname(out), exist_ok=True)
+with open(out, "w", encoding="utf-8") as f:
+    json.dump(manifest, f, indent=2)
+
+print(f"[INFO] Manifest gerado: {out}")
+PY
+}
+
+publish_to_hf() {
+  local wheel_path="$1"
+  local latest_json
+
+  [[ -n "$HF_REPO_ID" ]] || { warn "HF_REPO_ID não definido; pulando upload para HF."; return 0; }
+  [[ -n "$HF_TOKEN" ]] || { warn "HF_TOKEN não definido; pulando upload para HF."; return 0; }
+
+  latest_json="$(manifest_latest_path)"
+  [[ -f "$latest_json" ]] || die "Manifest não encontrado: $latest_json"
+
+  log "Publicando wheel + manifest no Hugging Face"
+  "$PYTHON_BIN" -m pip install -U huggingface_hub
+
+  WHEEL_PATH="$wheel_path" \
+  LATEST_JSON_PATH="$latest_json" \
+  HF_REPO_ID="$HF_REPO_ID" \
+  HF_REPO_TYPE="$HF_REPO_TYPE" \
+  HF_TOKEN="$HF_TOKEN" \
+  HF_PRIVATE="$HF_PRIVATE" \
+  REMOTE_DIR="$REMOTE_DIR" \
+  "$PYTHON_BIN" - <<'PY'
+import os
+from huggingface_hub import HfApi
+
+wheel = os.environ["WHEEL_PATH"]
+latest = os.environ["LATEST_JSON_PATH"]
+repo_id = os.environ["HF_REPO_ID"]
+repo_type = os.environ.get("HF_REPO_TYPE", "dataset")
+token = os.environ["HF_TOKEN"]
+remote_dir = os.environ.get("REMOTE_DIR", "sageattention220")
+private = os.environ.get("HF_PRIVATE", "false").lower() == "true"
+
+api = HfApi(token=token)
+api.create_repo(repo_id=repo_id, repo_type=repo_type, private=private, exist_ok=True)
+
+for local in (wheel, latest):
+    remote = f"{remote_dir}/{os.path.basename(local)}"
+    print(f"[INFO] Upload {local} -> {remote}")
+    api.upload_file(
+        path_or_fileobj=local,
+        path_in_repo=remote,
+        repo_id=repo_id,
+        repo_type=repo_type,
+    )
+
+print("[INFO] Upload para HF concluído")
+PY
+}
+
+build_wheel() {
+  require_cmd git
+  ensure_cuda_home
+
+  log "Instalando dependências de build"
+  "$PYTHON_BIN" -m pip install -U ninja cmake packaging
+
+  local build_stamp src_dir build_log wheel_path
+  build_stamp="$(date +%Y%m%d-%H%M%S)"
+  src_dir="$WORK_DIR/SageAttention-v${SAGE_VERSION}-${build_stamp}"
+  build_log="$LOG_DIR/build-sageattention-v${SAGE_VERSION}-${build_stamp}.log"
+
+  log "Clonando SageAttention v${SAGE_VERSION}"
+  git clone --depth 1 --branch "v${SAGE_VERSION}" https://github.com/thu-ml/SageAttention.git "$src_dir"
+
+  export TORCH_CUDA_ARCH_LIST
+  export CUDAARCHS
+  export EXT_PARALLEL
+  export MAX_JOBS
+  export NVCC_APPEND_FLAGS
+
+  log "Buildando wheel (target ${TORCH_CUDA_ARCH_LIST}, CUDAARCHS=${CUDAARCHS})"
+  "$PYTHON_BIN" -m pip wheel "$src_dir" --no-build-isolation --wheel-dir "$WHEELHOUSE_DIR" 2>&1 | tee "$build_log"
+
+  wheel_path="$(get_latest_local_wheel || true)"
+  [[ -n "$wheel_path" ]] || die "Wheel não encontrada após build em $WHEELHOUSE_DIR"
+
+  if grep -Eq 'sm_120|compute_120|12.0' "$build_log"; then
+    log "Build log contém referências a sm_120/compute_120."
+  else
+    warn "Não foi possível confirmar sm_120 no log. Verifique: $build_log"
+  fi
+
+  install_wheel_file "$wheel_path" || die "Falha ao instalar wheel recém-gerada"
+  build_manifest "$wheel_path"
+
+  echo "$wheel_path"
+}
+
+validate_runtime() {
+  "$PYTHON_BIN" - <<'PY'
+import importlib.metadata as md
+import torch
+
+print(f"[INFO] Validação final: sageattention={md.version('sageattention')}")
+print(f"[INFO] Validação final: torch={torch.__version__}, cuda={torch.version.cuda}")
+print(f"[INFO] Validação final: cuda_available={torch.cuda.is_available()}")
+if torch.cuda.is_available():
+    print(f"[INFO] Validação final: capability={torch.cuda.get_device_capability(0)}")
+PY
+}
+
+main() {
+  case "$ACTION" in
+    -h|--help|help)
+      usage
+      exit 0
+      ;;
+    auto|install|build|publish)
+      ;;
+    *)
+      usage
+      die "Ação inválida: $ACTION"
+      ;;
+  esac
+
+  ensure_python
+  ensure_pip_ready
+  detect_gpu
+
+  local hf_manifest=""
+  hf_manifest="$(fetch_hf_manifest || true)"
+  parse_manifest_stack "$hf_manifest"
+
+  case "$ACTION" in
+    install)
+      install_torch_stack
+      install_from_any_prebuilt || die "Nenhuma wheel pronta encontrada (local/HF)."
+      validate_runtime
+      ;;
+
+    build)
+      install_torch_stack
+      local wheel_path
+      wheel_path="$(build_wheel)"
+      publish_to_hf "$wheel_path"
+      validate_runtime
+      ;;
+
+    publish)
+      local wheel_path
+      wheel_path="$(get_latest_local_wheel || true)"
+      [[ -n "$wheel_path" ]] || die "Nenhuma wheel local para publicar em $WHEELHOUSE_DIR"
+      build_manifest "$wheel_path"
+      publish_to_hf "$wheel_path"
+      ;;
+
+    auto)
+      install_torch_stack
+      if install_from_any_prebuilt; then
+        log "Wheel pronta instalada com sucesso (sem rebuild)."
+      else
+        log "Wheel pronta não encontrada/falhou. Iniciando build local."
+        local wheel_path
+        wheel_path="$(build_wheel)"
+        publish_to_hf "$wheel_path"
+      fi
+      validate_runtime
+      ;;
+  esac
+
+  log "Concluído."
+}
+
+main "$@"

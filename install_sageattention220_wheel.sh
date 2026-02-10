@@ -8,7 +8,7 @@ set -Eeuo pipefail
 # 3) If unavailable/incompatible, build from source (v2.2.0, sm_120), install, and publish to HF
 
 ACTION="${1:-auto}"
-SCRIPT_VERSION="${SCRIPT_VERSION:-2026-02-10-a71f418}"
+SCRIPT_VERSION="${SCRIPT_VERSION:-2026-02-10-5507660}"
 
 SAGE_VERSION="${SAGE_VERSION:-2.2.0}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"

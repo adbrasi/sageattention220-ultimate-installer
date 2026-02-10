@@ -126,7 +126,8 @@ run_pip() {
 
   case "$cmd" in
     install|uninstall)
-      "$PYTHON_BIN" -m pip "$cmd" --break-system-packages "$@" || "$PYTHON_BIN" -m pip "$cmd" "$@"
+      "$PYTHON_BIN" -m pip "$cmd" --root-user-action=ignore --break-system-packages "$@" || \
+      "$PYTHON_BIN" -m pip "$cmd" --root-user-action=ignore "$@"
       ;;
     *)
       "$PYTHON_BIN" -m pip "$cmd" "$@"
@@ -647,8 +648,10 @@ build_wheel() {
   log "Buildando wheel para sm_120"
   run_pip wheel "$src_dir" --no-build-isolation --wheel-dir "$WHEELHOUSE_DIR" 2>&1 | tee "$build_log"
 
-  if ! grep -Eq 'sm_120|compute_120|12.0' "$build_log"; then
-    die "Build log não mostra sm_120/compute_120. Abortando para evitar wheel errada."
+  if grep -Eq 'sm_120|compute_120|12\\.0\\+PTX|Target compute capabilities:.*12\\.0|arch=compute_120|code=sm_120' "$build_log"; then
+    log "Build log indica target Blackwell (12.0/sm_120)."
+  else
+    warn "Build log não mostrou explicitamente sm_120; continuando com validação pós-instalação."
   fi
 
   wheel_path="$(get_latest_local_wheel || true)"

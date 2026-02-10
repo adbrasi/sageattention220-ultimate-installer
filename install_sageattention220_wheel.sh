@@ -1,16 +1,23 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Ultimate SageAttention 2.2.0 installer for RTX 5090 (sm_120)
+# Ultimate SageAttention installer for RTX 5090 (sm_120)
 # Safe flow:
 # 1) Always install/validate torch+triton stack first
 # 2) Install only wheel from your own HF repo manifest
-# 3) If unavailable/incompatible, build from source (v2.2.0, sm_120), install, and publish to HF
+# 3) If unavailable/incompatible, build from source (default: v2.2.0, sm_120), install, and publish to HF
 
 ACTION="${1:-auto}"
-SCRIPT_VERSION="${SCRIPT_VERSION:-2026-02-10-5507660}"
+SCRIPT_VERSION="${SCRIPT_VERSION:-2026-02-10-fix-upload-and-flow}"
 
+# Source selection:
+# - Default stable target: v2.2.0
+# - Optional latest build: SAGE_SOURCE_REF=main SAGE_EXPECT_VERSION=
 SAGE_VERSION="${SAGE_VERSION:-2.2.0}"
+SAGE_SOURCE_REPO="${SAGE_SOURCE_REPO:-https://github.com/thu-ml/SageAttention.git}"
+SAGE_SOURCE_REF="${SAGE_SOURCE_REF:-v${SAGE_VERSION}}"
+# Optional strict package version check after install (empty disables strict check).
+SAGE_EXPECT_VERSION="${SAGE_EXPECT_VERSION:-$SAGE_VERSION}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 # Torch stack defaults for Blackwell/5090
@@ -70,6 +77,9 @@ MANIFEST_TARGET_ARCH=""
 MANIFEST_SAGE_VERSION=""
 MANIFEST_BUILT_FROM_REPO=""
 MANIFEST_BUILT_FROM_REF=""
+MANIFEST_BUILT_FROM_COMMIT=""
+LAST_BUILT_WHEEL=""
+SAGE_SOURCE_COMMIT=""
 
 log() {
   printf '[INFO] %s\n' "$*"
@@ -92,7 +102,7 @@ Uso:
 Ações:
   auto    -> instala torch/triton, tenta wheel do seu HF; se não existir/for inválida, compila e publica
   install -> instala torch/triton e instala somente wheel do seu HF (falha se não houver)
-  build   -> força build local do SageAttention v2.2.0 (sm_120), instala e publica no HF
+  build   -> força build local do SageAttention (SAGE_SOURCE_REF), instala e publica no HF
   publish -> publica no HF a wheel local mais recente + latest.json
   init-hf -> cria/valida o repositório HF
 
@@ -217,6 +227,7 @@ print(d.get("target_arch") or "")
 print(d.get("sageattention_version") or "")
 print(d.get("built_from_repo") or "")
 print(d.get("built_from_ref") or "")
+print(d.get("built_from_commit") or "")
 PY
 )
 
@@ -231,6 +242,7 @@ PY
   MANIFEST_SAGE_VERSION="${_vals[8]:-}"
   MANIFEST_BUILT_FROM_REPO="${_vals[9]:-}"
   MANIFEST_BUILT_FROM_REF="${_vals[10]:-}"
+  MANIFEST_BUILT_FROM_COMMIT="${_vals[11]:-}"
 
   log "Manifest carregado de $MANIFEST_PATH"
 }
@@ -243,8 +255,8 @@ manifest_is_safe_for_5090() {
 
   [[ -n "$MANIFEST_WHEEL_FILE" || -n "$MANIFEST_HF_WHEEL_URL" ]] || return 1
 
-  if [[ -n "$MANIFEST_SAGE_VERSION" && "$MANIFEST_SAGE_VERSION" != "$SAGE_VERSION" ]]; then
-    warn "Manifest sageattention_version=${MANIFEST_SAGE_VERSION} != ${SAGE_VERSION}"
+  if [[ -n "$SAGE_EXPECT_VERSION" && -n "$MANIFEST_SAGE_VERSION" && "$MANIFEST_SAGE_VERSION" != "$SAGE_EXPECT_VERSION" ]]; then
+    warn "Manifest sageattention_version=${MANIFEST_SAGE_VERSION} != ${SAGE_EXPECT_VERSION}"
     return 1
   fi
 
@@ -262,7 +274,7 @@ manifest_is_safe_for_5090() {
     return 1
   fi
 
-  if [[ -n "$MANIFEST_BUILT_FROM_REF" && "$MANIFEST_BUILT_FROM_REF" != "v${SAGE_VERSION}" ]]; then
+  if [[ -n "$MANIFEST_BUILT_FROM_REF" && "$MANIFEST_BUILT_FROM_REF" != "$SAGE_SOURCE_REF" ]]; then
     warn "Manifest built_from_ref inesperado: $MANIFEST_BUILT_FROM_REF"
     return 1
   fi
@@ -320,30 +332,71 @@ if cap[0] == 12:
 PY
 }
 
+ensure_triton_for_5090() {
+  if [[ -n "$TRITON_VERSION" ]]; then
+    log "Instalando triton fixo: ${TRITON_VERSION}"
+    run_pip install --force-reinstall "triton==${TRITON_VERSION}"
+    return
+  fi
+
+  if MIN_TRITON_FOR_50XX="$MIN_TRITON_FOR_50XX" "$PYTHON_BIN" - <<'PY'
+import importlib.metadata as md
+import os
+import re
+import sys
+
+def parse_mm(v):
+    m = re.search(r"([0-9]+)\.([0-9]+)", v or "")
+    if not m:
+        return None
+    return (int(m.group(1)), int(m.group(2)))
+
+min_v = parse_mm(os.environ.get("MIN_TRITON_FOR_50XX", "3.3"))
+try:
+    cur_raw = md.version("triton")
+except Exception:
+    sys.exit(2)
+
+cur_v = parse_mm(cur_raw)
+if not cur_v or not min_v:
+    sys.exit(2)
+
+print(f"[INFO] triton atual: {cur_raw}")
+if cur_v < min_v:
+    sys.exit(3)
+PY
+  then
+    log "Mantendo triton atual (já compatível)."
+  else
+    case "$?" in
+      3) log "Triton abaixo do mínimo; atualizando para ${TRITON_SPEC}" ;;
+      *) log "Triton ausente/inválido; instalando ${TRITON_SPEC}" ;;
+    esac
+    run_pip install --force-reinstall -U "$TRITON_SPEC"
+  fi
+}
+
 install_torch_stack() {
-  local mode idx_url torch_pkg tv_pkg ta_pkg triton_pkg
+  local mode idx_url torch_pkg tv_pkg ta_pkg
   mode="default"
   idx_url="${TORCH_INDEX_URL:-}"
 
-  if [[ -n "$TORCH_VERSION" && -n "$TORCHVISION_VERSION" && -n "$TORCHAUDIO_VERSION" && -n "$TRITON_VERSION" ]]; then
+  if [[ -n "$TORCH_VERSION" && -n "$TORCHVISION_VERSION" && -n "$TORCHAUDIO_VERSION" ]]; then
     mode="env-pin"
     torch_pkg="torch==${TORCH_VERSION}"
     tv_pkg="torchvision==${TORCHVISION_VERSION}"
     ta_pkg="torchaudio==${TORCHAUDIO_VERSION}"
-    triton_pkg="triton==${TRITON_VERSION}"
-  elif [[ -n "$MANIFEST_TORCH_VERSION" && -n "$MANIFEST_TORCHVISION_VERSION" && -n "$MANIFEST_TORCHAUDIO_VERSION" && -n "$MANIFEST_TRITON_VERSION" ]]; then
+  elif [[ -n "$MANIFEST_TORCH_VERSION" && -n "$MANIFEST_TORCHVISION_VERSION" && -n "$MANIFEST_TORCHAUDIO_VERSION" ]]; then
     mode="manifest-pin"
     torch_pkg="torch==${MANIFEST_TORCH_VERSION}"
     tv_pkg="torchvision==${MANIFEST_TORCHVISION_VERSION}"
     ta_pkg="torchaudio==${MANIFEST_TORCHAUDIO_VERSION}"
-    triton_pkg="triton==${MANIFEST_TRITON_VERSION}"
     idx_url="${idx_url:-$MANIFEST_TORCH_INDEX_URL}"
   else
     mode="default"
     torch_pkg="torch"
     tv_pkg="torchvision"
     ta_pkg="torchaudio"
-    triton_pkg="$TRITON_SPEC"
   fi
 
   idx_url="${idx_url:-$(default_torch_index_url)}"
@@ -359,8 +412,7 @@ install_torch_stack() {
     run_pip install --force-reinstall "$torch_pkg" "$tv_pkg" "$ta_pkg" --index-url "$idx_url"
   fi
 
-  run_pip install --force-reinstall -U "$triton_pkg"
-
+  ensure_triton_for_5090
   validate_torch_stack
 }
 
@@ -399,10 +451,28 @@ PY
 
 get_latest_local_wheel() {
   shopt -s nullglob
-  local wheels=("$WHEELHOUSE_DIR"/sageattention-"$SAGE_VERSION"-*.whl)
+  local wheels
+  if [[ -n "$SAGE_EXPECT_VERSION" ]]; then
+    wheels=("$WHEELHOUSE_DIR"/sageattention-"$SAGE_EXPECT_VERSION"-*.whl)
+  else
+    wheels=("$WHEELHOUSE_DIR"/sageattention-*.whl)
+  fi
   shopt -u nullglob
   (( ${#wheels[@]} > 0 )) || return 1
   ls -1t "${wheels[@]}" | head -n1
+}
+
+validate_sage_version() {
+  SAGE_EXPECT_VERSION="$SAGE_EXPECT_VERSION" "$PYTHON_BIN" - <<'PY'
+import importlib.metadata as md
+import os
+
+v = md.version("sageattention")
+print(f"[INFO] sageattention instalado: {v}")
+expected = (os.environ.get("SAGE_EXPECT_VERSION") or "").strip()
+if expected and v != expected:
+    raise SystemExit(f"[ERROR] sageattention instalado ({v}) difere do esperado ({expected}).")
+PY
 }
 
 install_wheel_file() {
@@ -410,15 +480,7 @@ install_wheel_file() {
   [[ -f "$wheel_path" ]] || return 1
 
   run_pip install --force-reinstall "$wheel_path" || return 1
-
-  SAGE_VERSION_EXPECTED="$SAGE_VERSION" "$PYTHON_BIN" - <<'PY'
-import importlib.metadata as md
-import os
-v = md.version("sageattention")
-print(f"[INFO] sageattention instalado: {v}")
-if v != os.environ["SAGE_VERSION_EXPECTED"]:
-    raise SystemExit(f"[ERROR] sageattention instalado ({v}) difere do esperado ({os.environ['SAGE_VERSION_EXPECTED']}).")
-PY
+  validate_sage_version
 }
 
 install_wheel_url() {
@@ -427,15 +489,7 @@ install_wheel_url() {
 
   log "Tentando instalação por URL: $wheel_url"
   run_pip install --force-reinstall "$wheel_url" || return 1
-
-  SAGE_VERSION_EXPECTED="$SAGE_VERSION" "$PYTHON_BIN" - <<'PY'
-import importlib.metadata as md
-import os
-v = md.version("sageattention")
-print(f"[INFO] sageattention instalado: {v}")
-if v != os.environ["SAGE_VERSION_EXPECTED"]:
-    raise SystemExit(f"[ERROR] sageattention instalado ({v}) difere do esperado ({os.environ['SAGE_VERSION_EXPECTED']}).")
-PY
+  validate_sage_version
 }
 
 install_from_hf_manifest() {
@@ -483,7 +537,10 @@ build_manifest() {
   OUT_MANIFEST="$out" \
   GPU_NAME="$GPU_NAME" \
   GPU_CC="$GPU_CC" \
-  SAGE_VERSION="$SAGE_VERSION" \
+  SAGE_EXPECT_VERSION="$SAGE_EXPECT_VERSION" \
+  SAGE_SOURCE_REPO="$SAGE_SOURCE_REPO" \
+  SAGE_SOURCE_REF="$SAGE_SOURCE_REF" \
+  SAGE_SOURCE_COMMIT="$SAGE_SOURCE_COMMIT" \
   "$PYTHON_BIN" - <<'PY'
 import datetime
 import importlib.metadata as md
@@ -500,11 +557,12 @@ def pkg(name):
         return None
 
 manifest = {
-    "created_at_utc": datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+    "created_at_utc": datetime.datetime.now(datetime.UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
     "wheel_file": os.environ["WHEEL_FILE"],
     "wheel_sha256": os.environ["WHEEL_SHA256"],
     "hf_wheel_url": os.environ["HF_WHEEL_URL"],
-    "sageattention_version": os.environ["SAGE_VERSION"],
+    "sageattention_version": pkg("sageattention"),
+    "expected_sageattention_version": os.environ.get("SAGE_EXPECT_VERSION") or None,
     "torch_version": pkg("torch"),
     "torchvision_version": pkg("torchvision"),
     "torchaudio_version": pkg("torchaudio"),
@@ -514,8 +572,9 @@ manifest = {
     "cudaarchs": os.environ["CUDAARCHS"],
     "required_min_cuda": "12.8",
     "built_for": "RTX5090-sm120",
-    "built_from_repo": "https://github.com/thu-ml/SageAttention",
-    "built_from_ref": f"v{os.environ['SAGE_VERSION']}",
+    "built_from_repo": os.environ.get("SAGE_SOURCE_REPO") or None,
+    "built_from_ref": os.environ.get("SAGE_SOURCE_REF") or None,
+    "built_from_commit": os.environ.get("SAGE_SOURCE_COMMIT") or None,
     "builder_gpu_name": os.environ.get("GPU_NAME") or None,
     "builder_gpu_compute_capability": os.environ.get("GPU_CC") or None,
     "python_version": platform.python_version(),
@@ -632,13 +691,20 @@ build_wheel() {
 
   run_pip install -U ninja cmake packaging
 
-  local stamp src_dir build_log wheel_path
+  local stamp src_dir build_log wheel_path ref_slug
+  LAST_BUILT_WHEEL=""
+  SAGE_SOURCE_COMMIT=""
   stamp="$(date +%Y%m%d-%H%M%S)"
-  src_dir="$WORK_DIR/SageAttention-v${SAGE_VERSION}-${stamp}"
-  build_log="$LOG_DIR/build-sageattention-v${SAGE_VERSION}-${stamp}.log"
+  ref_slug="$(printf '%s' "$SAGE_SOURCE_REF" | tr '/:' '__')"
+  src_dir="$WORK_DIR/SageAttention-${ref_slug}-${stamp}"
+  build_log="$LOG_DIR/build-sageattention-${ref_slug}-${stamp}.log"
 
-  log "Clonando SageAttention v${SAGE_VERSION}"
-  git clone --depth 1 --branch "v${SAGE_VERSION}" https://github.com/thu-ml/SageAttention.git "$src_dir"
+  log "Clonando SageAttention (${SAGE_SOURCE_REPO} @ ${SAGE_SOURCE_REF})"
+  git clone --depth 1 --branch "$SAGE_SOURCE_REF" "$SAGE_SOURCE_REPO" "$src_dir"
+  SAGE_SOURCE_COMMIT="$(git -C "$src_dir" rev-parse HEAD 2>/dev/null || true)"
+  if [[ -n "$SAGE_SOURCE_COMMIT" ]]; then
+    log "Source commit: $SAGE_SOURCE_COMMIT"
+  fi
 
   export TORCH_CUDA_ARCH_LIST
   export CUDAARCHS
@@ -660,8 +726,7 @@ build_wheel() {
 
   install_wheel_file "$wheel_path"
   build_manifest "$wheel_path"
-
-  echo "$wheel_path"
+  LAST_BUILT_WHEEL="$wheel_path"
 }
 
 load_manifest_if_available() {
@@ -674,17 +739,19 @@ load_manifest_if_available() {
 }
 
 validate_runtime() {
-  SAGE_VERSION_EXPECTED="$SAGE_VERSION" "$PYTHON_BIN" - <<'PY'
+  SAGE_EXPECT_VERSION="$SAGE_EXPECT_VERSION" "$PYTHON_BIN" - <<'PY'
 import importlib.metadata as md
 import os
 import torch
 
 sv = md.version("sageattention")
-if sv != os.environ["SAGE_VERSION_EXPECTED"]:
-    raise SystemExit(f"[ERROR] sageattention={sv}, esperado={os.environ['SAGE_VERSION_EXPECTED']}")
+expected = (os.environ.get("SAGE_EXPECT_VERSION") or "").strip()
+if expected and sv != expected:
+    raise SystemExit(f"[ERROR] sageattention={sv}, esperado={expected}")
 
 print(f"[INFO] Validação final: sageattention={sv}")
 print(f"[INFO] Validação final: torch={torch.__version__}, cuda={torch.version.cuda}")
+print(f"[INFO] Validação final: cuda_available={torch.cuda.is_available()}")
 print(f"[INFO] Validação final: capability={torch.cuda.get_device_capability(0) if torch.cuda.is_available() else None}")
 PY
 }
@@ -732,7 +799,9 @@ main() {
       load_manifest_if_available
       install_torch_stack
       local built_wheel
-      built_wheel="$(build_wheel)"
+      build_wheel
+      built_wheel="$LAST_BUILT_WHEEL"
+      [[ -n "$built_wheel" ]] || die "Build concluído sem caminho de wheel."
       publish_to_hf "$built_wheel"
       validate_runtime
       ;;
@@ -764,7 +833,9 @@ main() {
       else
         log "Wheel válida não encontrada no HF. Iniciando build do zero."
         local built_wheel
-        built_wheel="$(build_wheel)"
+        build_wheel
+        built_wheel="$LAST_BUILT_WHEEL"
+        [[ -n "$built_wheel" ]] || die "Build concluído sem caminho de wheel."
 
         if [[ -n "$HF_TOKEN" ]]; then
           publish_to_hf "$built_wheel"

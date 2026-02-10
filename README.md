@@ -29,7 +29,7 @@ Exemplo que você citou:
 - `SAGE_VERSION=2.2.0`
 - `TORCH_CHANNEL=nightly`
 - `CUDA_INDEX_VARIANT=cu128`
-- `TRITON_SPEC=triton>=3.3`
+- `TRITON_SPEC=triton>=3.3,<4.0`
 - `TORCH_CUDA_ARCH_LIST=12.0`
 - `CUDAARCHS=120`
 

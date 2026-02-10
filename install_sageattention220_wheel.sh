@@ -21,8 +21,11 @@ TORCH_VERSION="${TORCH_VERSION:-}"
 TORCHVISION_VERSION="${TORCHVISION_VERSION:-}"
 TORCHAUDIO_VERSION="${TORCHAUDIO_VERSION:-}"
 TRITON_VERSION="${TRITON_VERSION:-}"
-TRITON_SPEC="${TRITON_SPEC:-triton>=3.3}"
+TRITON_SPEC="${TRITON_SPEC:-triton>=3.3,<4.0}"
 TORCH_INDEX_URL="${TORCH_INDEX_URL:-}"
+
+MIN_CUDA_FOR_SM120="${MIN_CUDA_FOR_SM120:-12.8}"
+MIN_TRITON_FOR_50XX="${MIN_TRITON_FOR_50XX:-3.3}"
 
 # Build target for RTX 5090 (sm_120)
 TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-12.0}"
@@ -290,6 +293,10 @@ install_torch_stack() {
     fi
   fi
 
+  if [[ "$source_mode" == "default" && "$TORCH_CHANNEL" != "nightly" ]]; then
+    warn "Para RTX 5090, o recomendado é TORCH_CHANNEL=nightly com CUDA_INDEX_VARIANT=cu128."
+  fi
+
   TORCH_INDEX_URL_USED="$idx_url"
   export TORCH_INDEX_URL_USED
 
@@ -304,9 +311,21 @@ install_torch_stack() {
 
   run_pip install --force-reinstall -U "$triton_pkg"
 
+  MIN_CUDA_FOR_SM120="$MIN_CUDA_FOR_SM120" \
+  MIN_TRITON_FOR_50XX="$MIN_TRITON_FOR_50XX" \
   "$PYTHON_BIN" - <<'PY'
 import importlib.metadata as md
+import os
 import torch
+
+def parse_maj_min(v: str):
+    parts = (v or "").split(".")
+    if len(parts) < 2:
+        return None
+    try:
+        return (int(parts[0]), int(parts[1]))
+    except Exception:
+        return None
 
 print(f"[INFO] torch: {torch.__version__}")
 print(f"[INFO] torchvision: {md.version('torchvision')}")
@@ -314,10 +333,37 @@ print(f"[INFO] torchaudio: {md.version('torchaudio')}")
 print(f"[INFO] triton: {md.version('triton')}")
 print(f"[INFO] torch.version.cuda: {torch.version.cuda}")
 print(f"[INFO] torch.cuda.is_available: {torch.cuda.is_available()}")
-if torch.cuda.is_available():
-    print(f"[INFO] device: {torch.cuda.get_device_name(0)}")
-    print(f"[INFO] capability: {torch.cuda.get_device_capability(0)}")
-print(f"[INFO] arch_list: {torch.cuda.get_arch_list()}")
+if not torch.cuda.is_available():
+    raise SystemExit("[ERROR] CUDA não disponível após instalação do stack torch/triton.")
+
+device = torch.cuda.get_device_name(0)
+cap = torch.cuda.get_device_capability(0)
+arch_list = torch.cuda.get_arch_list()
+triton_v = md.version("triton")
+cuda_v = (torch.version.cuda or "").strip()
+min_cuda_s = os.environ.get("MIN_CUDA_FOR_SM120", "12.8")
+min_triton_s = os.environ.get("MIN_TRITON_FOR_50XX", "3.3")
+
+print(f"[INFO] device: {device}")
+print(f"[INFO] capability: {cap}")
+print(f"[INFO] arch_list: {arch_list}")
+
+if not cuda_v:
+    raise SystemExit("[ERROR] torch.version.cuda vazio; build incompatível para RTX 5090.")
+
+cuda_mm = parse_maj_min(cuda_v)
+min_cuda_mm = parse_maj_min(min_cuda_s)
+if not cuda_mm or not min_cuda_mm or cuda_mm < min_cuda_mm:
+    raise SystemExit(f"[ERROR] CUDA do torch ({cuda_v}) < {min_cuda_s}. Use PyTorch cu128/nightly.")
+
+triton_mm = parse_maj_min(triton_v)
+min_triton_mm = parse_maj_min(min_triton_s)
+if not triton_mm or not min_triton_mm or triton_mm < min_triton_mm:
+    raise SystemExit(f"[ERROR] Triton ({triton_v}) < {min_triton_s}. Atualize o Triton.")
+
+if cap[0] == 12:
+    if not any("120" in arch for arch in arch_list):
+        raise SystemExit("[ERROR] Torch instalado não expõe sm_120 na arch_list.")
 PY
 }
 

@@ -13,5 +13,5 @@
 - [x] Fix wheel publish bug (path capture from build output)
 - [x] Restore consistent SageAttention version/ref handling (v2.2.0 default)
 - [x] Avoid unnecessary triton overwrite when torch stack already ships compatible triton
-- [ ] Revalidate script and publish updated installer to GitHub
+- [x] Revalidate script and publish updated installer to GitHub
 - [x] Update `README.md` and `activities.md` with final behavior

@@ -109,8 +109,32 @@ print(f"[INFO] Python: {sys.version.split()[0]} ({sys.executable})")
 PY
 }
 
+run_pip() {
+  local cmd
+  local err_file
+  cmd="${1:-}"
+  err_file="$WORK_DIR/.pip-fallback.err"
+
+  if "$PYTHON_BIN" -m pip "$@" 2>"$err_file"; then
+    rm -f "$err_file"
+    return 0
+  fi
+  shift || true
+
+  case "$cmd" in
+    install|uninstall)
+      "$PYTHON_BIN" -m pip "$cmd" --break-system-packages "$@"
+      ;;
+    *)
+      "$PYTHON_BIN" -m pip "$cmd" "$@"
+      ;;
+  esac
+
+  rm -f "$err_file"
+}
+
 ensure_pip_ready() {
-  "$PYTHON_BIN" -m pip install -U pip setuptools wheel
+  run_pip install -U pip setuptools wheel
 }
 
 detect_gpu() {
@@ -273,12 +297,12 @@ install_torch_stack() {
   log "Torch index: $idx_url"
 
   if [[ "$source_mode" == "default" && "$TORCH_CHANNEL" == "nightly" ]]; then
-    "$PYTHON_BIN" -m pip install --force-reinstall --pre "$torch_pkg" "$tv_pkg" "$ta_pkg" --index-url "$idx_url"
+    run_pip install --force-reinstall --pre "$torch_pkg" "$tv_pkg" "$ta_pkg" --index-url "$idx_url"
   else
-    "$PYTHON_BIN" -m pip install --force-reinstall "$torch_pkg" "$tv_pkg" "$ta_pkg" --index-url "$idx_url"
+    run_pip install --force-reinstall "$torch_pkg" "$tv_pkg" "$ta_pkg" --index-url "$idx_url"
   fi
 
-  "$PYTHON_BIN" -m pip install --force-reinstall -U "$triton_pkg"
+  run_pip install --force-reinstall -U "$triton_pkg"
 
   "$PYTHON_BIN" - <<'PY'
 import importlib.metadata as md
@@ -338,7 +362,7 @@ install_wheel_file() {
   [[ -f "$wheel_path" ]] || return 1
 
   log "Instalando wheel: $wheel_path"
-  "$PYTHON_BIN" -m pip install --force-reinstall "$wheel_path" || return 1
+  run_pip install --force-reinstall "$wheel_path" || return 1
 
   "$PYTHON_BIN" - <<'PY'
 import importlib.metadata as md
@@ -353,7 +377,7 @@ install_wheel_url() {
   [[ -n "$wheel_url" ]] || return 1
 
   log "Tentando instalação por URL: $wheel_url"
-  "$PYTHON_BIN" -m pip install --force-reinstall "$wheel_url" || return 1
+  run_pip install --force-reinstall "$wheel_url" || return 1
 
   "$PYTHON_BIN" - <<'PY'
 import importlib.metadata as md
@@ -489,13 +513,41 @@ print(f"[INFO] Manifest gerado: {out}")
 PY
 }
 
+get_hf_python() {
+  local hf_python="$PYTHON_BIN"
+  local hf_venv="$WORK_DIR/.hf_venv"
+
+  if "$hf_python" - <<'PY' >/dev/null 2>&1
+import huggingface_hub
+PY
+  then
+    echo "$hf_python"
+    return 0
+  fi
+
+  if run_pip install -q -U huggingface_hub >/dev/null 2>&1; then
+    echo "$hf_python"
+    return 0
+  fi
+
+  log "pip global indisponível para huggingface_hub; usando venv auxiliar em $hf_venv"
+  if [[ ! -x "$hf_venv/bin/python" ]]; then
+    "$PYTHON_BIN" -m venv "$hf_venv"
+  fi
+  "$hf_venv/bin/python" -m pip install -q -U pip
+  "$hf_venv/bin/python" -m pip install -q -U huggingface_hub
+  echo "$hf_venv/bin/python"
+}
+
 publish_to_hf() {
   local wheel_path="$1"
   local latest_json
+  local hf_python
 
   [[ -n "$HF_REPO_ID" ]] || die "HF_REPO_ID não definido."
   [[ -n "$HF_TOKEN" ]] || die "HF_TOKEN não definido."
 
+  hf_python="$(get_hf_python)"
   ensure_hf_repo
 
   latest_json="$(manifest_latest_path)"
@@ -510,7 +562,7 @@ publish_to_hf() {
   HF_TOKEN="$HF_TOKEN" \
   HF_PRIVATE="$HF_PRIVATE" \
   REMOTE_DIR="$REMOTE_DIR" \
-  "$PYTHON_BIN" - <<'PY'
+  "$hf_python" - <<'PY'
 import os
 from huggingface_hub import HfApi
 
@@ -537,16 +589,17 @@ PY
 }
 
 ensure_hf_repo() {
+  local hf_python
   [[ -n "$HF_REPO_ID" ]] || die "HF_REPO_ID não definido."
   [[ -n "$HF_TOKEN" ]] || die "HF_TOKEN não definido."
 
-  "$PYTHON_BIN" -m pip install -U huggingface_hub
+  hf_python="$(get_hf_python)"
 
   HF_REPO_ID="$HF_REPO_ID" \
   HF_REPO_TYPE="$HF_REPO_TYPE" \
   HF_TOKEN="$HF_TOKEN" \
   HF_PRIVATE="$HF_PRIVATE" \
-  "$PYTHON_BIN" - <<'PY'
+  "$hf_python" - <<'PY'
 from huggingface_hub import HfApi
 import os
 
@@ -566,7 +619,7 @@ build_wheel() {
   ensure_cuda_home
 
   log "Instalando dependências de build"
-  "$PYTHON_BIN" -m pip install -U ninja cmake packaging
+  run_pip install -U ninja cmake packaging
 
   local build_stamp src_dir build_log wheel_path
   build_stamp="$(date +%Y%m%d-%H%M%S)"
@@ -583,7 +636,7 @@ build_wheel() {
   export NVCC_APPEND_FLAGS
 
   log "Buildando wheel (target ${TORCH_CUDA_ARCH_LIST}, CUDAARCHS=${CUDAARCHS})"
-  "$PYTHON_BIN" -m pip wheel "$src_dir" --no-build-isolation --wheel-dir "$WHEELHOUSE_DIR" 2>&1 | tee "$build_log"
+  run_pip wheel "$src_dir" --no-build-isolation --wheel-dir "$WHEELHOUSE_DIR" 2>&1 | tee "$build_log"
 
   wheel_path="$(get_latest_local_wheel || true)"
   [[ -n "$wheel_path" ]] || die "Wheel não encontrada após build em $WHEELHOUSE_DIR"
@@ -613,6 +666,12 @@ if torch.cuda.is_available():
 PY
 }
 
+load_manifest_if_available() {
+  local hf_manifest=""
+  hf_manifest="$(fetch_hf_manifest || true)"
+  parse_manifest_stack "$hf_manifest"
+}
+
 main() {
   case "$ACTION" in
     -h|--help|help)
@@ -631,18 +690,16 @@ main() {
   ensure_pip_ready
   detect_gpu
 
-  local hf_manifest=""
-  hf_manifest="$(fetch_hf_manifest || true)"
-  parse_manifest_stack "$hf_manifest"
-
   case "$ACTION" in
     install)
+      load_manifest_if_available
       install_torch_stack
       install_from_any_prebuilt || die "Nenhuma wheel pronta encontrada (HF/URL)."
       validate_runtime
       ;;
 
     build)
+      load_manifest_if_available
       install_torch_stack
       local wheel_path
       wheel_path="$(build_wheel)"
@@ -663,6 +720,7 @@ main() {
       ;;
 
     auto)
+      load_manifest_if_available
       install_torch_stack
       if install_from_any_prebuilt; then
         log "Wheel pronta instalada com sucesso (sem rebuild)."

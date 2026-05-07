@@ -11,7 +11,7 @@ set -Eeuo pipefail
 [[ "${BASH_VERSINFO[0]}" -ge 4 ]] || { printf '[ERROR] Bash 4+ required.\n' >&2; exit 1; }
 
 ACTION="${1:-auto}"
-SCRIPT_VERSION="${SCRIPT_VERSION:-2026-03-04-multi-gpu}"
+SCRIPT_VERSION="${SCRIPT_VERSION:-2026-05-07-cu13-routing}"
 
 # --- Source selection ---
 SAGE_VERSION="${SAGE_VERSION:-2.2.0}"
@@ -40,12 +40,29 @@ MAX_JOBS="${MAX_JOBS:-$(nproc)}"
 NVCC_APPEND_FLAGS="${NVCC_APPEND_FLAGS:---threads 8}"
 
 # --- HF artifact storage ---
-HF_REPO_ID="${HF_REPO_ID:-adbrasi/sageattention220-wheels}"
+# Defaults are routed per torch CUDA major (cu12 vs cu13) at runtime by
+# route_hf_for_torch_cuda13 — wheels for CUDA 13 live in a separate dataset
+# because the prebuilt cu12 wheels link libcudart.so.12 and won't load
+# under torch+cu130.
+HF_REPO_ID_DEFAULT_CU12="${HF_REPO_ID_DEFAULT_CU12:-adbrasi/sageattention220-wheels}"
+HF_REPO_ID_DEFAULT_CU13="${HF_REPO_ID_DEFAULT_CU13:-AdwolfCzar/sageattention220-wheels}"
+REMOTE_DIR_DEFAULT_CU12="${REMOTE_DIR_DEFAULT_CU12:-sageattention220}"
+REMOTE_DIR_DEFAULT_CU13="${REMOTE_DIR_DEFAULT_CU13:-sageattention220_cu13}"
+
+# Capture explicit user overrides BEFORE applying defaults so the routing
+# helper knows whether it's allowed to switch repo.
+_HF_REPO_ID_USER_SET=0
+_REMOTE_DIR_USER_SET=0
+[[ -n "${HF_REPO_ID:-}" ]] && _HF_REPO_ID_USER_SET=1
+[[ -n "${REMOTE_DIR:-}" ]] && _REMOTE_DIR_USER_SET=1
+
+HF_REPO_ID="${HF_REPO_ID:-$HF_REPO_ID_DEFAULT_CU12}"
 HF_REPO_TYPE="${HF_REPO_TYPE:-dataset}"
 HF_REPO_BRANCH="${HF_REPO_BRANCH:-main}"
 HF_PRIVATE="${HF_PRIVATE:-false}"
 HF_TOKEN="${HF_TOKEN:-}"
-REMOTE_DIR="${REMOTE_DIR:-sageattention220}"
+REMOTE_DIR="${REMOTE_DIR:-$REMOTE_DIR_DEFAULT_CU12}"
+_HF_ROUTING_DONE=0
 
 # Optional explicit wheel URL (bypasses registry lookup)
 WHEEL_URL="${WHEEL_URL:-}"
@@ -365,7 +382,33 @@ hf_curl() {
 
 # ===== Registry System =====
 
+# When torch is already installed and built against CUDA 13.x, the prebuilt
+# cu12 wheels in adbrasi/sageattention220-wheels link libcudart.so.12 and fail
+# to import (RTX PRO 6000 Blackwell scenario). Switch the default HF repo to
+# the cu13-built dataset, but only if the user hasn't pinned HF_REPO_ID /
+# REMOTE_DIR explicitly. Idempotent — runs at most once per execution.
+route_hf_for_torch_cuda13() {
+  [[ "$_HF_ROUTING_DONE" == "1" ]] && return 0
+  local cuda_major
+  cuda_major="$("$PYTHON_BIN" -c "
+import torch
+v = (torch.version.cuda or '').split('.')
+print(v[0] if v and v[0] else '')
+" 2>/dev/null || true)"
+  if [[ "$cuda_major" == "13" ]]; then
+    if [[ "$_HF_REPO_ID_USER_SET" == "0" ]]; then
+      HF_REPO_ID="$HF_REPO_ID_DEFAULT_CU13"
+    fi
+    if [[ "$_REMOTE_DIR_USER_SET" == "0" ]]; then
+      REMOTE_DIR="$REMOTE_DIR_DEFAULT_CU13"
+    fi
+    log "torch CUDA 13.x detectado — usando wheels cu13 de ${HF_REPO_ID}/${REMOTE_DIR}"
+  fi
+  _HF_ROUTING_DONE=1
+}
+
 fetch_registry() {
+  route_hf_for_torch_cuda13
   local url out
 
   # Try registry.json first
@@ -379,16 +422,17 @@ fetch_registry() {
     return 0
   fi
 
-  # Fallback: try legacy latest.json
-  url="$(build_hf_resolve_url "$HF_REPO_ID" "$HF_REPO_TYPE" "$HF_REPO_BRANCH" "${REMOTE_DIR}/latest.json")"
-  out="$WORK_DIR/hf-latest.json"
-
-  if hf_curl "$url" "$out" && [[ -s "$out" ]]; then
-    REGISTRY_PATH="$out"
-    REGISTRY_IS_LEGACY="true"
-    log "latest.json (legado) encontrado no HF."
-    return 0
-  fi
+  # Fallback: try legacy latest_cu13.json (preferred for cu13) then latest.json
+  for manifest_name in latest_cu13.json latest.json; do
+    url="$(build_hf_resolve_url "$HF_REPO_ID" "$HF_REPO_TYPE" "$HF_REPO_BRANCH" "${REMOTE_DIR}/${manifest_name}")"
+    out="$WORK_DIR/hf-${manifest_name}"
+    if hf_curl "$url" "$out" && [[ -s "$out" ]]; then
+      REGISTRY_PATH="$out"
+      REGISTRY_IS_LEGACY="true"
+      log "${manifest_name} (legado) encontrado no HF."
+      return 0
+    fi
+  done
 
   return 1
 }

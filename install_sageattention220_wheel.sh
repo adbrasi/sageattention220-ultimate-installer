@@ -11,7 +11,7 @@ set -Eeuo pipefail
 [[ "${BASH_VERSINFO[0]}" -ge 4 ]] || { printf '[ERROR] Bash 4+ required.\n' >&2; exit 1; }
 
 ACTION="${1:-auto}"
-SCRIPT_VERSION="${SCRIPT_VERSION:-2026-05-07-cu13-routing}"
+SCRIPT_VERSION="${SCRIPT_VERSION:-2026-07-12-stack-abi-cache-v2}"
 
 # --- Source selection ---
 SAGE_VERSION="${SAGE_VERSION:-2.2.0}"
@@ -117,6 +117,7 @@ SAGE_SOURCE_COMMIT=""
 REGISTRY_PATH=""
 REGISTRY_IS_LEGACY="false"
 REG_TORCH_VERSION=""
+REG_TORCH_CUDA_VERSION=""
 REG_TORCHVISION_VERSION=""
 REG_TORCHAUDIO_VERSION=""
 REG_TRITON_VERSION=""
@@ -128,6 +129,7 @@ REG_SAGE_VERSION=""
 REG_BUILT_FROM_REPO=""
 REG_BUILT_FROM_REF=""
 REG_BUILT_FROM_COMMIT=""
+REG_ARTIFACT_KEY=""
 
 # ===== Utilities =====
 
@@ -164,7 +166,7 @@ Variáveis de ambiente (todas opcionais, auto-detectadas quando possível):
   TRITON_SPEC          ex: triton>=3.0,<4.0 (auto do mínimo para a GPU)
   SKIP_TORCH_INSTALL=1 pula instalação do torch stack (usa o que já está instalado)
   HF_TOKEN             necessário para publish/init-hf
-  HF_REPO_ID           default: adbrasi/sageattention220-wheels
+  HF_REPO_ID           auto: adbrasi (CUDA 12) ou AdwolfCzar (CUDA 13)
   SAGE_SOURCE_REF      default: v2.2.0 (use "main" para build da branch principal)
 USAGE
 }
@@ -191,6 +193,54 @@ run_pip() {
       "$PYTHON_BIN" -m pip "$cmd" "$@"
       ;;
   esac
+}
+
+current_package_version() {
+  local package_name="$1"
+  "$PYTHON_BIN" - "$package_name" <<'PY'
+import importlib.metadata as md
+import sys
+
+try:
+    print(md.version(sys.argv[1]))
+except md.PackageNotFoundError:
+    raise SystemExit(1)
+PY
+}
+
+current_torch_cuda_version() {
+  "$PYTHON_BIN" - <<'PY'
+import torch
+
+if not torch.version.cuda:
+    raise SystemExit(1)
+print(torch.version.cuda)
+PY
+}
+
+runtime_artifact_key() {
+  local torch_version torch_cuda_version triton_version
+  torch_version="$(current_package_version torch)" || return 1
+  torch_cuda_version="$(current_torch_cuda_version)" || return 1
+  triton_version="$(current_package_version triton)" || return 1
+  TORCH_VERSION_CURRENT="$torch_version" \
+    TORCH_CUDA_VERSION_CURRENT="$torch_cuda_version" \
+    TRITON_VERSION_CURRENT="$triton_version" \
+    "$PYTHON_BIN" - <<'PY'
+import os
+import re
+
+
+def safe(value):
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip("-_")
+
+
+print(
+    f"torch-{safe(os.environ['TORCH_VERSION_CURRENT'])}_"
+    f"cuda-{safe(os.environ['TORCH_CUDA_VERSION_CURRENT'])}_"
+    f"triton-{safe(os.environ['TRITON_VERSION_CURRENT'])}"
+)
+PY
 }
 
 ensure_pip_ready() {
@@ -440,9 +490,12 @@ fetch_registry() {
 parse_registry_entry() {
   [[ -n "$REGISTRY_PATH" && -f "$REGISTRY_PATH" ]] || return 1
 
-  local python_tag
+  local python_tag current_torch current_torch_cuda current_triton lookup_key
   python_tag="$("$PYTHON_BIN" -c "import sys; print(f'cp{sys.version_info.major}{sys.version_info.minor}')")"
-  local lookup_key="${GPU_SM}-${python_tag}"
+  current_torch="$(current_package_version torch)" || return 1
+  current_torch_cuda="$(current_torch_cuda_version)" || return 1
+  current_triton="$(current_package_version triton)" || return 1
+  lookup_key="${GPU_SM}-${python_tag}-$(runtime_artifact_key)"
 
   log "Procurando wheel para: ${lookup_key}"
 
@@ -453,6 +506,7 @@ import json, sys
 with open("$REGISTRY_PATH", "r", encoding="utf-8") as f:
     d = json.load(f)
 print(d.get("torch_version") or "")
+print(d.get("torch_cuda_version") or "")
 print(d.get("torchvision_version") or "")
 print(d.get("torchaudio_version") or "")
 print(d.get("triton_version") or "")
@@ -464,27 +518,35 @@ print(d.get("sageattention_version") or "")
 print(d.get("built_from_repo") or "")
 print(d.get("built_from_ref") or "")
 print(d.get("built_from_commit") or "")
+print(d.get("artifact_key") or "")
 PY
     )
     REG_TORCH_VERSION="${_vals[0]:-}"
-    REG_TORCHVISION_VERSION="${_vals[1]:-}"
-    REG_TORCHAUDIO_VERSION="${_vals[2]:-}"
-    REG_TRITON_VERSION="${_vals[3]:-}"
-    REG_TORCH_INDEX_URL="${_vals[4]:-}"
-    REG_WHEEL_FILE="${_vals[5]:-}"
-    REG_HF_WHEEL_URL="${_vals[6]:-}"
-    REG_SM="${_vals[7]:-}"
-    REG_SAGE_VERSION="${_vals[8]:-}"
-    REG_BUILT_FROM_REPO="${_vals[9]:-}"
-    REG_BUILT_FROM_REF="${_vals[10]:-}"
-    REG_BUILT_FROM_COMMIT="${_vals[11]:-}"
+    REG_TORCH_CUDA_VERSION="${_vals[1]:-}"
+    REG_TORCHVISION_VERSION="${_vals[2]:-}"
+    REG_TORCHAUDIO_VERSION="${_vals[3]:-}"
+    REG_TRITON_VERSION="${_vals[4]:-}"
+    REG_TORCH_INDEX_URL="${_vals[5]:-}"
+    REG_WHEEL_FILE="${_vals[6]:-}"
+    REG_HF_WHEEL_URL="${_vals[7]:-}"
+    REG_SM="${_vals[8]:-}"
+    REG_SAGE_VERSION="${_vals[9]:-}"
+    REG_BUILT_FROM_REPO="${_vals[10]:-}"
+    REG_BUILT_FROM_REF="${_vals[11]:-}"
+    REG_BUILT_FROM_COMMIT="${_vals[12]:-}"
+    REG_ARTIFACT_KEY="${_vals[13]:-}"
 
     log "Manifest legado carregado (target_arch=${REG_SM})"
     return 0
   fi
 
-  # Registry mode: find entry matching our key
-  readarray -t _vals < <(GPU_SM="$GPU_SM" PYTHON_TAG="$python_tag" "$PYTHON_BIN" - <<PY
+  # Registry mode: match the complete binary/runtime ABI, not only SM + Python.
+  readarray -t _vals < <(GPU_SM="$GPU_SM" \
+    PYTHON_TAG="$python_tag" \
+    CURRENT_TORCH_VERSION="$current_torch" \
+    CURRENT_TORCH_CUDA_VERSION="$current_torch_cuda" \
+    CURRENT_TRITON_VERSION="$current_triton" \
+    "$PYTHON_BIN" - <<PY
 import json, os, sys
 
 with open("$REGISTRY_PATH", "r", encoding="utf-8") as f:
@@ -492,11 +554,20 @@ with open("$REGISTRY_PATH", "r", encoding="utf-8") as f:
 
 gpu_sm = os.environ["GPU_SM"]
 py_tag = os.environ["PYTHON_TAG"]
-lookup = f"{gpu_sm}-{py_tag}"
+torch_version = os.environ["CURRENT_TORCH_VERSION"]
+torch_cuda_version = os.environ["CURRENT_TORCH_CUDA_VERSION"]
+triton_version = os.environ["CURRENT_TRITON_VERSION"]
 
 for entry in data.get("wheels", []):
-    if entry.get("key") == lookup:
+    if (
+        entry.get("sm") == gpu_sm
+        and entry.get("python_tag") == py_tag
+        and entry.get("torch_version") == torch_version
+        and entry.get("torch_cuda_version") == torch_cuda_version
+        and entry.get("triton_version") == triton_version
+    ):
         print(entry.get("torch_version") or "")
+        print(entry.get("torch_cuda_version") or "")
         print(entry.get("torchvision_version") or "")
         print(entry.get("torchaudio_version") or "")
         print(entry.get("triton_version") or "")
@@ -508,6 +579,7 @@ for entry in data.get("wheels", []):
         print(entry.get("built_from_repo") or "")
         print(entry.get("built_from_ref") or "")
         print(entry.get("built_from_commit") or "")
+        print(entry.get("artifact_key") or "")
         sys.exit(0)
 
 # No match
@@ -516,17 +588,19 @@ PY
   ) || return 1
 
   REG_TORCH_VERSION="${_vals[0]:-}"
-  REG_TORCHVISION_VERSION="${_vals[1]:-}"
-  REG_TORCHAUDIO_VERSION="${_vals[2]:-}"
-  REG_TRITON_VERSION="${_vals[3]:-}"
-  REG_TORCH_INDEX_URL="${_vals[4]:-}"
-  REG_WHEEL_FILE="${_vals[5]:-}"
-  REG_HF_WHEEL_URL="${_vals[6]:-}"
-  REG_SM="${_vals[7]:-}"
-  REG_SAGE_VERSION="${_vals[8]:-}"
-  REG_BUILT_FROM_REPO="${_vals[9]:-}"
-  REG_BUILT_FROM_REF="${_vals[10]:-}"
-  REG_BUILT_FROM_COMMIT="${_vals[11]:-}"
+  REG_TORCH_CUDA_VERSION="${_vals[1]:-}"
+  REG_TORCHVISION_VERSION="${_vals[2]:-}"
+  REG_TORCHAUDIO_VERSION="${_vals[3]:-}"
+  REG_TRITON_VERSION="${_vals[4]:-}"
+  REG_TORCH_INDEX_URL="${_vals[5]:-}"
+  REG_WHEEL_FILE="${_vals[6]:-}"
+  REG_HF_WHEEL_URL="${_vals[7]:-}"
+  REG_SM="${_vals[8]:-}"
+  REG_SAGE_VERSION="${_vals[9]:-}"
+  REG_BUILT_FROM_REPO="${_vals[10]:-}"
+  REG_BUILT_FROM_REF="${_vals[11]:-}"
+  REG_BUILT_FROM_COMMIT="${_vals[12]:-}"
+  REG_ARTIFACT_KEY="${_vals[13]:-}"
 
   log "Registry entry encontrada para ${lookup_key}"
   return 0
@@ -539,6 +613,27 @@ validate_registry_entry() {
   fi
 
   [[ -n "$REG_WHEEL_FILE" || -n "$REG_HF_WHEEL_URL" ]] || return 1
+
+  local current_torch current_torch_cuda current_triton
+  current_torch="$(current_package_version torch)" || return 1
+  current_torch_cuda="$(current_torch_cuda_version)" || return 1
+  current_triton="$(current_package_version triton)" || return 1
+
+  if [[ -z "$REG_TORCH_VERSION" || "$REG_TORCH_VERSION" != "$current_torch" ]]; then
+    warn "Wheel torch=${REG_TORCH_VERSION:-desconhecido} != runtime torch=${current_torch}; build necessário."
+    return 1
+  fi
+
+  if [[ -z "$REG_TRITON_VERSION" || "$REG_TRITON_VERSION" != "$current_triton" ]]; then
+    warn "Wheel triton=${REG_TRITON_VERSION:-desconhecido} != runtime triton=${current_triton}; build necessário."
+    return 1
+  fi
+
+  if [[ "$REGISTRY_IS_LEGACY" != "true" ]] && \
+    [[ -z "$REG_TORCH_CUDA_VERSION" || "$REG_TORCH_CUDA_VERSION" != "$current_torch_cuda" ]]; then
+    warn "Wheel torch CUDA=${REG_TORCH_CUDA_VERSION:-desconhecido} != runtime CUDA=${current_torch_cuda}; build necessário."
+    return 1
+  fi
 
   # Version check
   if [[ -n "$SAGE_EXPECT_VERSION" && -n "$REG_SAGE_VERSION" && "$REG_SAGE_VERSION" != "$SAGE_EXPECT_VERSION" ]]; then
@@ -595,9 +690,11 @@ install_from_registry() {
       wheel_url="$(build_hf_resolve_url "$HF_REPO_ID" "$HF_REPO_TYPE" "$HF_REPO_BRANCH" \
         "${REMOTE_DIR}/${REG_WHEEL_FILE}")"
     else
-      # New: SM subdirectory
+      # New: stack-specific subdirectory so different torch ABIs never collide.
+      local artifact_key
+      artifact_key="${REG_ARTIFACT_KEY:-$(runtime_artifact_key)}"
       wheel_url="$(build_hf_resolve_url "$HF_REPO_ID" "$HF_REPO_TYPE" "$HF_REPO_BRANCH" \
-        "${REMOTE_DIR}/${GPU_SM}/${REG_WHEEL_FILE}")"
+        "${REMOTE_DIR}/${GPU_SM}/${artifact_key}/${REG_WHEEL_FILE}")"
     fi
   else
     return 1
@@ -855,25 +952,29 @@ ensure_cuda_home() {
 # ===== Wheel helpers =====
 
 get_latest_local_wheel() {
-  shopt -s nullglob
-  local wheels
-  if [[ -n "$SAGE_EXPECT_VERSION" ]]; then
-    wheels=("$WHEELHOUSE_DIR"/sageattention-"$SAGE_EXPECT_VERSION"-*.whl)
-  else
-    wheels=("$WHEELHOUSE_DIR"/sageattention-*.whl)
-  fi
-  shopt -u nullglob
-  (( ${#wheels[@]} > 0 )) || return 1
-  ls -1t "${wheels[@]}" | head -n1
+  local search_dir="${1:-$WHEELHOUSE_DIR}"
+  SEARCH_DIR="$search_dir" SAGE_EXPECT_VERSION="$SAGE_EXPECT_VERSION" "$PYTHON_BIN" - <<'PY'
+import os
+from pathlib import Path
+
+root = Path(os.environ["SEARCH_DIR"])
+version = os.environ.get("SAGE_EXPECT_VERSION", "")
+pattern = f"sageattention-{version}-*.whl" if version else "sageattention-*.whl"
+wheels = list(root.rglob(pattern)) if root.is_dir() else []
+if not wheels:
+    raise SystemExit(1)
+print(max(wheels, key=lambda path: path.stat().st_mtime))
+PY
 }
 
 validate_sage_version() {
   SAGE_EXPECT_VERSION="$SAGE_EXPECT_VERSION" "$PYTHON_BIN" - <<'PY'
 import importlib.metadata as md
 import os
+import sageattention
 
 v = md.version("sageattention")
-print(f"[INFO] sageattention instalado: {v}")
+print(f"[INFO] sageattention instalado e importável: {v}")
 expected = (os.environ.get("SAGE_EXPECT_VERSION") or "").strip()
 if expected and v != expected:
     raise SystemExit(f"[ERROR] sageattention instalado ({v}) difere do esperado ({expected}).")
@@ -911,21 +1012,23 @@ latest_local_path() {
 
 build_registry_entry() {
   local wheel_path="$1"
-  local wheel_file sha registry_out latest_out hf_wheel_url
+  local wheel_file sha registry_out latest_out hf_wheel_url artifact_key
 
   wheel_file="$(basename "$wheel_path")"
   sha="$(wheel_sha256 "$wheel_path")"
+  artifact_key="$(runtime_artifact_key)"
 
   registry_out="$(registry_local_path)"
   latest_out="$(latest_local_path)"
   mkdir -p "$(dirname "$registry_out")"
 
   hf_wheel_url="$(build_hf_resolve_url "$HF_REPO_ID" "$HF_REPO_TYPE" "$HF_REPO_BRANCH" \
-    "${REMOTE_DIR}/${GPU_SM}/${wheel_file}")"
+    "${REMOTE_DIR}/${GPU_SM}/${artifact_key}/${wheel_file}")"
 
   WHEEL_FILE="$wheel_file" \
   WHEEL_SHA256="$sha" \
   HF_WHEEL_URL="$hf_wheel_url" \
+  ARTIFACT_KEY="$artifact_key" \
   TORCH_INDEX_URL_USED="${TORCH_INDEX_URL_USED:-}" \
   TORCH_CUDA_ARCH_LIST="$TORCH_CUDA_ARCH_LIST" \
   CUDAARCHS="$CUDAARCHS" \
@@ -947,6 +1050,7 @@ import json
 import os
 import platform
 import sys
+import torch
 
 
 def pkg(name):
@@ -959,18 +1063,21 @@ def pkg(name):
 now_utc = datetime.datetime.now(datetime.UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 python_tag = f"cp{sys.version_info.major}{sys.version_info.minor}"
 gpu_sm = os.environ["GPU_SM"]
-entry_key = f"{gpu_sm}-{python_tag}"
+artifact_key = os.environ["ARTIFACT_KEY"]
+entry_key = f"{gpu_sm}-{python_tag}-{artifact_key}"
 
 entry = {
     "key": entry_key,
     "sm": gpu_sm,
     "compute_capability": os.environ["GPU_CC"],
     "python_tag": python_tag,
+    "artifact_key": artifact_key,
     "wheel_file": os.environ["WHEEL_FILE"],
     "wheel_sha256": os.environ["WHEEL_SHA256"],
     "hf_wheel_url": os.environ["HF_WHEEL_URL"],
     "sageattention_version": pkg("sageattention"),
     "torch_version": pkg("torch"),
+    "torch_cuda_version": torch.version.cuda,
     "torchvision_version": pkg("torchvision"),
     "torchaudio_version": pkg("torchaudio"),
     "triton_version": pkg("triton"),
@@ -991,7 +1098,7 @@ entry = {
 
 # --- Update registry.json ---
 registry_path = os.environ["REGISTRY_OUT"]
-registry = {"schema_version": 1, "updated_at_utc": now_utc, "wheels": []}
+registry = {"schema_version": 2, "updated_at_utc": now_utc, "wheels": []}
 
 # Load existing registry if present
 if os.path.isfile(registry_path):
@@ -1013,6 +1120,7 @@ if not replaced:
     wheels.append(entry)
 
 registry["wheels"] = wheels
+registry["schema_version"] = 2
 registry["updated_at_utc"] = now_utc
 
 with open(registry_path, "w", encoding="utf-8") as f:
@@ -1114,7 +1222,7 @@ for w in local.get("wheels", []):
         merged[k] = w  # local wins
 
 result = {
-    "schema_version": 1,
+    "schema_version": 2,
     "updated_at_utc": local.get("updated_at_utc", remote.get("updated_at_utc", "")),
     "wheels": list(merged.values()),
 }
@@ -1136,17 +1244,18 @@ publish_to_hf() {
   ensure_hf_repo
   merge_remote_registry
 
-  local hf_python registry_json latest_json wheel_file
+  local hf_python registry_json latest_json wheel_file artifact_key
   hf_python="$(get_hf_python)"
   registry_json="$(registry_local_path)"
   latest_json="$(latest_local_path)"
   wheel_file="$(basename "$wheel_path")"
+  artifact_key="$(runtime_artifact_key)"
 
   [[ -f "$registry_json" ]] || die "Registry não encontrado: $registry_json"
   [[ -f "$latest_json" ]] || die "latest.json não encontrado: $latest_json"
 
   WHEEL_PATH="$wheel_path" \
-  WHEEL_REMOTE="${REMOTE_DIR}/${GPU_SM}/${wheel_file}" \
+  WHEEL_REMOTE="${REMOTE_DIR}/${GPU_SM}/${artifact_key}/${wheel_file}" \
   REGISTRY_PATH="$registry_json" \
   REGISTRY_REMOTE="${REMOTE_DIR}/registry.json" \
   LATEST_PATH="$latest_json" \
@@ -1189,13 +1298,16 @@ build_wheel() {
 
   run_pip install -U ninja cmake packaging
 
-  local stamp src_dir build_log wheel_path ref_slug
+  local stamp src_dir build_log wheel_path ref_slug artifact_key build_wheel_dir
   LAST_BUILT_WHEEL=""
   SAGE_SOURCE_COMMIT=""
   stamp="$(date +%Y%m%d-%H%M%S)"
   ref_slug="$(printf '%s' "$SAGE_SOURCE_REF" | tr '/:' '__')"
   src_dir="$WORK_DIR/SageAttention-${ref_slug}-${stamp}"
   build_log="$LOG_DIR/build-sageattention-${ref_slug}-${stamp}.log"
+  artifact_key="$(runtime_artifact_key)"
+  build_wheel_dir="$WHEELHOUSE_DIR/builds/$artifact_key"
+  mkdir -p "$build_wheel_dir"
 
   log "Clonando SageAttention (${SAGE_SOURCE_REPO} @ ${SAGE_SOURCE_REF})"
   git clone --depth 1 --branch "$SAGE_SOURCE_REF" "$SAGE_SOURCE_REPO" "$src_dir"
@@ -1211,7 +1323,7 @@ build_wheel() {
   export NVCC_APPEND_FLAGS
 
   log "Buildando wheel para ${GPU_SM} (TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}, CUDAARCHS=${CUDAARCHS})"
-  run_pip wheel "$src_dir" --no-build-isolation --wheel-dir "$WHEELHOUSE_DIR" 2>&1 | tee "$build_log"
+  run_pip wheel "$src_dir" --no-build-isolation --wheel-dir "$build_wheel_dir" 2>&1 | tee "$build_log"
 
   # Dynamic build log verification
   local build_pattern="sm_${GPU_SM_NUM}|compute_${GPU_SM_NUM}|${GPU_CC}\\+PTX|arch=compute_${GPU_SM_NUM}|code=sm_${GPU_SM_NUM}"
@@ -1221,7 +1333,7 @@ build_wheel() {
     warn "Build log não mostrou explicitamente ${GPU_SM}; continuando com validação pós-instalação."
   fi
 
-  wheel_path="$(get_latest_local_wheel || true)"
+  wheel_path="$(get_latest_local_wheel "$build_wheel_dir" || true)"
   [[ -n "$wheel_path" ]] || die "Nenhuma wheel encontrada após build."
 
   install_wheel_file "$wheel_path"
@@ -1235,6 +1347,7 @@ validate_runtime() {
   SAGE_EXPECT_VERSION="$SAGE_EXPECT_VERSION" "$PYTHON_BIN" - <<'PY'
 import importlib.metadata as md
 import os
+import sageattention
 import torch
 
 sv = md.version("sageattention")
@@ -1243,6 +1356,7 @@ if expected and sv != expected:
     raise SystemExit(f"[ERROR] sageattention={sv}, esperado={expected}")
 
 print(f"[INFO] Validação final: sageattention={sv}")
+print("[INFO] Validação final: import sageattention OK")
 print(f"[INFO] Validação final: torch={torch.__version__}, cuda={torch.version.cuda}")
 print(f"[INFO] Validação final: cuda_available={torch.cuda.is_available()}")
 if torch.cuda.is_available():
@@ -1284,14 +1398,15 @@ main() {
 
   case "$ACTION" in
     init-hf)
+      route_hf_for_torch_cuda13
       ensure_hf_repo
       log "Concluído."
       exit 0
       ;;
 
     install)
-      load_registry_if_available
       install_torch_stack
+      load_registry_if_available
 
       if [[ -n "$WHEEL_URL" ]]; then
         install_wheel_url "$WHEEL_URL" || die "Falha ao instalar WHEEL_URL informado."
@@ -1303,8 +1418,8 @@ main() {
       ;;
 
     build)
-      load_registry_if_available
       install_torch_stack
+      load_registry_if_available
       build_wheel
       [[ -n "$LAST_BUILT_WHEEL" ]] || die "Build concluído sem caminho de wheel."
       if [[ -n "$HF_TOKEN" ]]; then
@@ -1316,16 +1431,19 @@ main() {
       ;;
 
     publish)
-      local wheel_to_publish
-      wheel_to_publish="$(get_latest_local_wheel || true)"
+      local wheel_to_publish artifact_key build_wheel_dir
+      route_hf_for_torch_cuda13
+      artifact_key="$(runtime_artifact_key)"
+      build_wheel_dir="$WHEELHOUSE_DIR/builds/$artifact_key"
+      wheel_to_publish="$(get_latest_local_wheel "$build_wheel_dir" || true)"
       [[ -n "$wheel_to_publish" ]] || die "Nenhuma wheel local encontrada para publish."
       build_registry_entry "$wheel_to_publish"
       publish_to_hf "$wheel_to_publish"
       ;;
 
     auto)
-      load_registry_if_available
       install_torch_stack
+      load_registry_if_available
 
       if [[ -n "$WHEEL_URL" ]]; then
         if install_wheel_url "$WHEEL_URL"; then
@@ -1358,4 +1476,6 @@ main() {
   log "Concluído."
 }
 
-main "$@"
+if [[ "${SAGE_INSTALLER_TEST_MODE:-0}" != "1" ]]; then
+  main "$@"
+fi

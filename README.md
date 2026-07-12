@@ -25,9 +25,10 @@ Instala SageAttention 2.2.0 em **qualquer GPU NVIDIA** automaticamente. Detecta 
 
 1. Detecta GPU (compute capability) e CUDA do sistema
 2. **Verifica se torch stack atual já funciona** — se sim, não reinstala nada
-3. Procura wheel compatível no HF via `registry.json` (por SM + versão do Python)
+3. Procura wheel compatível no HF via `registry.json` (por SM + Python + Torch/CUDA + Triton)
 4. Se encontrou → instala direto do HF (rápido, sem compilação)
-5. Se não encontrou → compila do zero, instala, e publica no HF para próximas máquinas
+5. Se a stack divergir ou o import real falhar → compila do zero contra o Torch ativo
+6. Valida `import sageattention` e só então publica no HF para próximas máquinas
 
 ## Uso rápido
 
@@ -44,17 +45,20 @@ curl -fsSL https://raw.githubusercontent.com/adbrasi/sageattention220-ultimate-i
 curl -fsSL https://raw.githubusercontent.com/adbrasi/sageattention220-ultimate-installer/main/install_sageattention220_wheel.sh | bash -s -- auto
 ```
 
-Se já existe wheel para o SM da sua GPU no HF, não recompila.
+Se já existe wheel para a combinação exata de GPU, Python, Torch/CUDA e Triton, não recompila.
 
 ## Repositório HF
 
-- `adbrasi/sageattention220-wheels` (tipo: `dataset`)
+- CUDA 12: `adbrasi/sageattention220-wheels` (tipo: `dataset`)
+- CUDA 13: `AdwolfCzar/sageattention220-wheels` (tipo: `dataset`)
 - Estrutura:
   ```
   sageattention220/
   ├── registry.json         ← índice de todas as wheels
   ├── latest.json           ← última wheel publicada (backward compat)
-  ├── sm_120/               ← wheels para Blackwell consumer
+  ├── sm_120/               ← arquitetura da GPU
+  │   ├── torch-2.13.0-cu130_cuda-13.0_triton-3.7.1/
+  │   └── torch-2.11.0-cu130_cuda-13.0_triton-3.6.0/
   ├── sm_89/                ← wheels para Ada Lovelace
   ├── sm_90/                ← wheels para Hopper
   └── sm_80/                ← wheels para Ampere
@@ -104,3 +108,6 @@ O script **não reinstala torch se o stack atual já funciona**. Ele verifica:
 - arch_list inclui o SM da GPU
 
 Se tudo OK, pula direto para a instalação do SageAttention.
+
+O cache de SageAttention exige correspondência exata de `torch`, CUDA do Torch e `triton`.
+Isso evita carregar extensões C++ compiladas contra outra ABI do PyTorch.

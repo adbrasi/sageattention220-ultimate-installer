@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Single-script universal installer for **SageAttention 2.2.0** supporting any NVIDIA GPU. Auto-detects GPU compute capability, manages torch/triton stack, and caches built wheels on HuggingFace per GPU architecture.
+Single-script universal installer for **SageAttention 2.2.0** supporting any NVIDIA GPU. Auto-detects GPU compute capability, manages the torch/triton stack, and caches built wheels on HuggingFace per GPU architecture and runtime ABI.
 
 The sole deliverable is `install_sageattention220_wheel.sh`.
 
@@ -13,6 +13,9 @@ The sole deliverable is `install_sageattention220_wheel.sh`.
 ```bash
 # Validate syntax
 bash -n install_sageattention220_wheel.sh
+
+# Run contract tests
+tests/test_installer.sh
 
 # Show help
 ./install_sageattention220_wheel.sh --help
@@ -39,15 +42,16 @@ bash install_sageattention220_wheel.sh init-hf    # create/validate HF repo
 `install_torch_stack()` calls `check_torch_stack_ok()` first — if current torch already satisfies the GPU requirements (CUDA version, triton version, arch_list), it skips installation entirely. This avoids unnecessary reinstalls when the user already has a working stack.
 
 ### Registry System (HF)
-- `registry.json` on HF maps `(sm_XX, python_tag)` → wheel metadata
+- `registry.json` on HF maps `(sm_XX, python_tag, torch, torch CUDA, triton)` → wheel metadata
 - Backward compatible: falls back to `latest.json` if registry doesn't exist
-- Wheels stored in SM subdirectories: `sageattention220/sm_120/`, `sageattention220/sm_89/`, etc.
+- Wheels use stack-specific paths such as `sageattention220/sm_120/torch-2.13.0-cu130_cuda-13.0_triton-3.7.1/`
 - `merge_remote_registry()` handles concurrent builds from different GPU types
+- Metadata-only success is insufficient: every installed or built wheel must pass `import sageattention`
 
 ### `auto` Action Flow
 ```
-detect_gpu → detect_system_cuda → load_registry_if_available
-→ install_torch_stack (skips if already OK)
+detect_gpu → detect_system_cuda → install_torch_stack (skips if already OK)
+→ load_registry_if_available
 → install_from_registry (if matching wheel exists)
 → OR build_wheel + publish_to_hf (if no wheel found)
 → validate_runtime
